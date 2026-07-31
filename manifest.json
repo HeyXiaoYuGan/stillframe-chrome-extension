@@ -1,0 +1,57 @@
+{
+  "manifest_version": 3,
+  "name": "定格 StillFrame",
+  "version": "1.0.0",
+  "minimum_chrome_version": "109",
+  "description": "在本地扫描网页图片与媒体，支持截图、打包及 Pinterest、B站保存工具。",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApSz/2gdTxy62EppE83IrBOfEoyUL/KnltABw2EEDfrhOjEy+nBOezfHPNmvTSk1fbgSG5iTs4O00CclQIQaufjPaI+Irtjby8AD1wrShgQizcWbH6qDAz+usyKFoop6a5gueW+PDp/8WPlZADdZL4CGBKOl/NS7jO1iLKva40B4eVUZWgzapuH7B3DENPDiShPDOo4ST5u11LNEFTNZkUUnf30EjTB80vmPXKT9vPw5JclPjezRLF3LYxkL3e/2wljdo4BA+tNKDEbeKzLxa8Nn030VTz8fdFcRBlg4NdXjEF08iWY6sncUjf3YeSZXR5arUMKN1ZUBZd6/qi2Yu4wIDAQAB",
+  "permissions": [
+    "contextMenus",
+    "declarativeNetRequestWithHostAccess",
+    "downloads",
+    "notifications",
+    "offscreen",
+    "scripting",
+    "storage",
+    "webRequest"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "i18n.js",
+        "content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_title": "定格 StillFrame",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon-16.png",
+      "32": "icon-32.png",
+      "48": "icon-48.png",
+      "128": "icon-128.png"
+    }
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "icons": {
+    "16": "icon-16.png",
+    "32": "icon-32.png",
+    "48": "icon-48.png",
+    "128": "icon-128.png"
+  }
+}

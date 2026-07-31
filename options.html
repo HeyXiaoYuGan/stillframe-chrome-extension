@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>定格 StillFrame 设置</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main class="settings-shell">
+      <aside>
+        <div class="settings-brand">
+          <span class="settings-logo"><i></i></span>
+          <div><strong>定格</strong><small>SNAPSHOT SETTINGS</small></div>
+        </div>
+        <nav aria-label="设置分类">
+          <button class="active" type="button" data-section="general" aria-selected="true">常规</button>
+          <button type="button" data-section="media" aria-selected="false">媒体扫描</button>
+          <button type="button" data-section="video-download" aria-selected="false">视频下载</button>
+          <button type="button" data-section="capture" aria-selected="false">网页截图</button>
+          <button type="button" data-section="behavior" aria-selected="false">通知</button>
+        </nav>
+        <span class="settings-version" id="settingsVersion">V—</span>
+      </aside>
+
+      <section class="settings-content">
+        <header>
+          <div>
+            <span class="eyebrow">STILLFRAME PREFERENCES</span>
+            <h1>定格设置</h1>
+            <p>所有设置仅保存在当前浏览器中。</p>
+          </div>
+          <span class="saved-indicator" id="savedIndicator" role="status" hidden>已保存</span>
+        </header>
+
+        <form id="settingsForm">
+          <section class="settings-card" id="general">
+            <div class="card-heading">
+              <span>01</span>
+              <div><h2>常规</h2><p>选择打开功能面板时默认显示的工具。</p></div>
+            </div>
+            <label class="setting-row">
+              <span><b>默认功能</b><small>打开定格时首先显示的页面</small></span>
+              <select id="feature">
+                <option value="images">提取图片与视频</option>
+                <option value="screenshot">网页截图</option>
+                <option value="bilibili">B站视频下载</option>
+              </select>
+            </label>
+            <label class="setting-row">
+              <span><b>界面语言</b><small>切换插件面板、网页弹窗、右键菜单和通知语言</small></span>
+              <select id="uiLanguage" data-stillframe-language>
+                <option value="zh">中文</option>
+                <option value="en">English</option>
+              </select>
+            </label>
+          </section>
+
+          <section class="settings-card" id="media" hidden>
+            <div class="card-heading">
+              <span>02</span>
+              <div><h2>媒体扫描与预览</h2><p>控制浏览网页时的实时发现和放大图片策略。</p></div>
+            </div>
+            <label class="setting-row">
+              <span><b>实时扫描</b><small>新加载的图片和视频自动加入列表</small></span>
+              <input class="switch" id="liveScan" type="checkbox" />
+            </label>
+            <label class="setting-row">
+              <span><b>小图筛选</b><small>根据真实像素和图片用途过滤头像、图标及尺寸过小的图片</small></span>
+              <select id="imageFilterLevel">
+                <option value="off">不筛选</option>
+                <option value="relaxed">宽松</option>
+                <option value="standard">标准（推荐）</option>
+                <option value="strict">严格</option>
+              </select>
+            </label>
+            <label class="setting-row">
+              <span><b>放大时优先原图</b><small>网页中央预览先尝试高清原图，失败后回退</small></span>
+              <input class="switch" id="preferOriginalPreview" type="checkbox" />
+            </label>
+            <label class="setting-row">
+              <span><b>多图浏览默认布局</b><small>打开网页中央图片画廊时采用的排列方式，也可在画廊内即时切换</small></span>
+              <select id="previewLayout">
+                <option value="square">方块模式</option>
+                <option value="waterfall">瀑布流模式</option>
+              </select>
+            </label>
+          </section>
+
+          <section class="settings-card" id="video-download" hidden>
+            <div class="card-heading">
+              <span>03</span>
+              <div><h2>B站视频下载</h2><p>这里设置首选项；下载弹窗只显示当前会话实际返回的规格。</p></div>
+            </div>
+            <div class="setting-row">
+              <span><b>附加内容</b><small>封面默认关闭；需要时可手动开启</small></span>
+              <span class="inline-switches">
+                <label><input id="biliDownloadCover" type="checkbox" />封面</label>
+                <label><input id="biliDownloadAudio" type="checkbox" />音频</label>
+                <label><input id="biliDownloadDanmaku" type="checkbox" />XML弹幕</label>
+                <label><input id="biliDownloadSrt" type="checkbox" />SRT字幕</label>
+                <label><input id="biliDownloadAss" type="checkbox" />ASS字幕</label>
+              </span>
+            </div>
+            <div class="setting-grid">
+              <label><span>画质</span><select id="biliQuality"><option value="127">8K</option><option value="126">杜比视界</option><option value="125">HDR</option><option value="120">4K</option><option value="116">1080P 60帧</option><option value="112">1080P 高码率</option><option value="80">1080P</option><option value="74">720P 60帧</option><option value="64">720P</option><option value="32">480P</option><option value="16">360P</option><option value="6">240P</option></select></label>
+              <label><span>音质</span><select id="biliAudioQuality"><option value="hires">Hi-Res 优先</option><option value="30280">192K</option><option value="30232">132K</option><option value="30216">64K</option></select></label>
+              <label><span>编码</span><select id="biliCodec"><option value="avc">AVC</option><option value="hevc">HEVC</option><option value="av1">AV1</option></select></label>
+            </div>
+            <label class="setting-row">
+              <span><b>命名模板</b><small>支持 %title%、%bvid%、%page%、%quality%</small></span>
+              <input class="text-input" id="biliFilenameTemplate" type="text" maxlength="160" placeholder="%title%" />
+            </label>
+          </section>
+
+          <section class="settings-card" id="capture" hidden>
+            <div class="card-heading">
+              <span>04</span>
+              <div><h2>网页截图</h2><p>设置默认截图范围、格式和延时。</p></div>
+            </div>
+            <div class="setting-grid">
+              <label><span>默认范围</span><select id="mode"><option value="visible">可见区域</option><option value="full">完整页面</option></select></label>
+              <label><span>默认格式</span><select id="format"><option value="png">PNG</option><option value="jpeg">JPG</option><option value="pdf">PDF</option></select></label>
+              <label><span>延时拍摄</span><select id="delay"><option value="0">立即</option><option value="3">3 秒</option><option value="5">5 秒</option></select></label>
+            </div>
+          </section>
+
+          <section class="settings-card" id="behavior" hidden>
+            <div class="card-heading">
+              <span>05</span>
+              <div><h2>通知</h2><p>控制下载与后台任务的完成提示。</p></div>
+            </div>
+            <label class="setting-row">
+              <span><b>系统通知</b><small>下载、打包和视频处理完成后显示通知</small></span>
+              <input class="switch" id="notificationsEnabled" type="checkbox" />
+            </label>
+          </section>
+
+          <footer class="settings-actions">
+            <button class="secondary" id="resetButton" type="button">恢复默认</button>
+            <button class="primary" type="submit">保存设置</button>
+          </footer>
+        </form>
+      </section>
+    </main>
+    <script src="i18n.js"></script>
+    <script src="options.js"></script>
+  </body>
+</html>

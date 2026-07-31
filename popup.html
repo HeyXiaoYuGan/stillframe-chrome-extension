@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>定格 StillFrame</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header>
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"><i></i></span>
+          <div>
+            <strong>定格</strong>
+            <small>SNAPSHOT</small>
+          </div>
+        </div>
+        <div class="header-actions">
+          <select class="language-select" data-stillframe-language aria-label="界面语言">
+            <option value="zh">中文</option>
+            <option value="en">English</option>
+          </select>
+          <button id="openOptionsButton" type="button">设置</button>
+          <span class="version" id="versionLabel">V1.0.0</span>
+        </div>
+      </header>
+
+      <nav class="feature-tabs" aria-label="功能选择">
+        <button class="feature-tab active" type="button" data-feature="images">
+          <span aria-hidden="true">▦</span>
+          提取图片与视频
+        </button>
+        <button class="feature-tab" type="button" data-feature="screenshot">
+          <span aria-hidden="true">◉</span>
+          网页截图
+        </button>
+        <button class="feature-tab" type="button" data-feature="bilibili">
+          <svg class="bilibili-tab-icon" aria-hidden="true" viewBox="0 0 24 24">
+            <path d="m8 4 4 3 4-3"></path>
+            <rect x="3" y="7" width="18" height="13" rx="4"></rect>
+            <path d="m10 11 5 3-5 3z"></path>
+          </svg>
+          B站视频
+        </button>
+      </nav>
+
+      <div class="progress" id="progress" hidden>
+        <div class="progress-heading">
+          <strong>当前处理进度</strong>
+          <b id="progressPercent">0%</b>
+        </div>
+        <div class="progress-track"><i id="progressBar"></i></div>
+        <div class="progress-status">
+          <span id="progressText">准备处理…</span>
+          <button id="cancelJobButton" type="button" hidden>取消任务</button>
+        </div>
+      </div>
+
+      <section class="feature-panel" id="imagesPanel">
+        <div class="panel-intro">
+          <h1>找到网页里的<br /><em>图片与短视频。</em></h1>
+          <p>实时扫描图片、懒加载资源、CSS 背景图和可下载的视频文件。</p>
+        </div>
+
+        <button class="primary-button" id="scanButton" type="button">
+          <span id="scanButtonText">扫描当前网页媒体</span>
+          <b aria-hidden="true">→</b>
+        </button>
+
+        <div class="image-results" id="imageResults" hidden>
+          <div class="results-toolbar">
+            <div class="result-summary">
+              <div class="result-title">
+                <strong id="resultCount">找到 0 项媒体</strong>
+                <span class="live-indicator"><i></i>实时监听</span>
+              </div>
+              <small id="selectedCount">已选择 0 项</small>
+            </div>
+            <div class="result-heading-actions">
+              <button class="clear-scanned" id="clearScannedButton" type="button">清空扫描</button>
+            </div>
+            <button class="browse-all-media" id="openGalleryButton" type="button" disabled>
+              <span>浏览全部媒体</span>
+              <b aria-hidden="true">▦</b>
+            </button>
+            <label class="panel-image-filter">
+              <span>图片筛选级别</span>
+              <select id="imageFilterLevelSelect">
+                <option value="off">不筛选</option>
+                <option value="relaxed">宽松</option>
+                <option value="standard">标准（推荐）</option>
+                <option value="strict">严格</option>
+              </select>
+            </label>
+            <div class="selection-actions" aria-label="批量选择">
+              <button id="bulkSelectAllButton" type="button">全选</button>
+              <button id="bulkSelectImagesButton" type="button">全选图片</button>
+              <button id="bulkSelectVideosButton" type="button">全选视频</button>
+            </div>
+          </div>
+
+          <div class="image-grid" id="imageGrid"></div>
+
+          <div class="download-actions">
+            <button class="download-selected" id="downloadImagesButton" type="button" disabled>
+            <span>下载所选</span>
+              <b id="downloadCount">0</b>
+            </button>
+            <button class="package-selected" id="packageImagesButton" type="button" disabled>
+              <span>打包 ZIP</span>
+              <b aria-hidden="true">⇩</b>
+            </button>
+          </div>
+        </div>
+
+        <div class="empty-hint" id="emptyHint">
+          <span class="scan-frame" aria-hidden="true"><i></i></span>
+          <strong>等待扫描</strong>
+          <p>新出现的图片和视频会实时加入这里</p>
+        </div>
+      </section>
+
+      <section class="feature-panel" id="screenshotPanel" hidden>
+        <div class="panel-intro compact">
+          <h2>把整个网页定格下来。</h2>
+          <p>保留当前屏幕画面，或者从页面顶部一直截到底部。</p>
+        </div>
+
+        <span class="section-label">抓取范围</span>
+        <div class="capture-grid">
+          <button class="capture-option active" type="button" data-mode="visible">
+            <span class="option-icon visible-icon" aria-hidden="true"><i></i></span>
+            <strong>可见区域</strong>
+            <small>当前屏幕内容</small>
+          </button>
+          <button class="capture-option" type="button" data-mode="full">
+            <span class="option-icon full-icon" aria-hidden="true"><i></i><i></i><i></i></span>
+            <strong>完整页面</strong>
+            <small>从顶部截到底部</small>
+          </button>
+        </div>
+
+        <div class="settings">
+          <label>
+            <span>图片格式</span>
+            <select id="format">
+              <option value="png">PNG · 高清</option>
+              <option value="jpeg">JPG · 小体积</option>
+              <option value="pdf">PDF · 自动分页</option>
+            </select>
+          </label>
+          <label>
+            <span>延时拍摄</span>
+            <select id="delay">
+              <option value="0">立即</option>
+              <option value="3">3 秒</option>
+              <option value="5">5 秒</option>
+            </select>
+          </label>
+        </div>
+
+        <button class="primary-button shutter" id="captureButton" type="button">
+          <span id="buttonText">拍下可见区域</span>
+          <b aria-hidden="true"><i></i></b>
+        </button>
+      </section>
+
+      <section class="feature-panel bilibili-panel" id="bilibiliPanel" hidden>
+        <div class="panel-intro compact">
+          <h2>B站视频下载</h2>
+          <p>只读取当前页面的视频列表，不扫描页面图片。</p>
+        </div>
+
+        <button class="primary-button bili-scan" id="biliScanButton" type="button">
+          <span id="biliScanButtonText">扫描主视频与分P</span>
+          <b aria-hidden="true">→</b>
+        </button>
+
+        <div class="bili-results" id="biliResults" hidden>
+          <div class="bili-toolbar">
+            <div>
+              <strong id="biliVideoTitle">当前 B站视频</strong>
+              <small id="biliPartSummary">找到 0 个视频</small>
+            </div>
+            <button id="biliSelectAllButton" type="button">取消全选</button>
+          </div>
+
+          <div class="bili-settings-grid">
+            <label>画质
+              <select id="biliQuality">
+                <option value="127">8K</option><option value="126">杜比视界</option>
+                <option value="125">HDR</option><option value="120">4K</option>
+                <option value="116">1080P 60帧</option><option value="112">1080P 高码率</option>
+                <option value="80">1080P</option><option value="74">720P 60帧</option>
+                <option value="64">720P</option><option value="32">480P</option>
+                <option value="16">360P</option><option value="6">240P</option>
+              </select>
+            </label>
+            <label>音质
+              <select id="biliAudioQuality">
+                <option value="hires">Hi-Res 优先</option><option value="30280">192K</option>
+                <option value="30232">132K</option><option value="30216">64K</option>
+              </select>
+            </label>
+            <label>编码
+              <select id="biliCodec">
+                <option value="avc">AVC</option><option value="hevc">HEVC</option>
+                <option value="av1">AV1</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="bili-extras">
+            <label><input id="biliAudio" type="checkbox" checked>音频</label>
+            <label><input id="biliSrt" type="checkbox" checked>SRT 字幕</label>
+            <label><input id="biliAss" type="checkbox">ASS 字幕</label>
+            <label><input id="biliCover" type="checkbox">封面</label>
+            <label><input id="biliDanmaku" type="checkbox">XML 弹幕</label>
+          </div>
+
+          <div class="bili-part-list" id="biliPartList"></div>
+
+          <div class="bili-actions">
+            <button id="biliDownloadCurrentButton" type="button">下载当前视频</button>
+            <button id="biliPackageSelectedButton" type="button">打包下载视频</button>
+          </div>
+        </div>
+
+        <div class="empty-hint bili-empty" id="biliEmptyHint">
+          <span class="scan-frame" aria-hidden="true"><i></i></span>
+          <strong>等待扫描 B站视频</strong>
+          <p>不会把页面图片加入此列表</p>
+        </div>
+      </section>
+
+      <div
+        class="preview-modal"
+        id="previewModal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="previewTitle"
+        hidden
+      >
+        <div class="preview-modal-header">
+          <div>
+            <strong id="previewTitle">图片预览</strong>
+            <small id="previewMeta">—</small>
+          </div>
+          <button id="closePreviewButton" type="button" aria-label="关闭图片预览">×</button>
+        </div>
+        <div class="preview-stage" id="previewStage">
+          <img id="previewImage" alt="放大的网页图片" />
+          <span id="previewFallback" hidden>正在尝试其他可用图片地址…</span>
+        </div>
+        <div class="preview-modal-actions">
+          <button id="previousPreviewButton" type="button">← 上一张</button>
+          <b id="previewCounter">1 / 1</b>
+          <button id="nextPreviewButton" type="button">下一张 →</button>
+        </div>
+      </div>
+
+      <div class="message" id="message" role="status" aria-live="polite" hidden></div>
+
+      <footer>
+        <span><i></i> 媒体仅在你的浏览器中处理</span>
+        <span>⌘ · STILLFRAME</span>
+      </footer>
+    </main>
+    <script src="i18n.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

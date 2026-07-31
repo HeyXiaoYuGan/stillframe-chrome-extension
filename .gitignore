@@ -1,0 +1,49 @@
+# Dependencies and generated output
+node_modules/
+dist/
+build/
+coverage/
+
+# Packaged extensions and archives
+*.zip
+*.ZIP
+*.crx
+*.CRX
+*.xpi
+*.XPI
+
+# Secrets and signing material
+.env
+.env.*
+!.env.example
+*.pem
+*.PEM
+*.key
+*.KEY
+*.p12
+*.P12
+*.pfx
+*.PFX
+
+# Logs, temporary files, and caches
+*.log
+*.LOG
+logs/
+tmp/
+temp/
+.cache/
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# Browser test profiles
+chrome-profile/
+test-profile/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
