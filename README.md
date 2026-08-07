@@ -100,8 +100,7 @@ StillFrame 自有源码采用 [MIT License](LICENSE)。Mediabunny 继续适用�
 
 > StillFrame 是一款本地运行的 Chrome 网页媒体提取工具，支持图片与视频扫描、高清去重、媒体画廊、ZIP 打包、网页截图，以及 Pinterest 和 B站专用下载功能。
 
-## Features (English)
-
+## Features
 StillFrame is a local-first media extraction extension for Chrome and Chromium-based browsers. It discovers, filters, previews, and saves images and videos from web pages without uploading media or browsing data to a maintainer-operated server.
 
 ### Media discovery and preview
