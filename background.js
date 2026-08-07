@@ -2690,6 +2690,7 @@ async function packageBilibiliParts(tab, jobId, requestOptions = {}) {
 
   const resolvedItems = [];
   const attachments = [];
+  const resolutionFailures = [];
   for (const [index, part] of selectedParts.entries()) {
     await assertActiveJob(jobId);
     await updateActiveJob(jobId, {
@@ -2720,12 +2721,18 @@ async function packageBilibiliParts(tab, jobId, requestOptions = {}) {
         title: resolved.title,
       });
       attachments.push(...(await collectBilibiliPartAttachments(resolved)));
-    } catch {
-      // Keep resolving the remaining selected parts.
+    } catch (error) {
+      resolutionFailures.push(
+        `P${part.page} ${part.title}：${error?.message || "解析失败"}`,
+      );
     }
   }
   if (!resolvedItems.length) {
-    throw new Error("所选分P均未返回当前账号可播放的视频流。");
+    throw new Error(
+      `所选分P均未返回当前账号可播放的视频流。${
+        resolutionFailures.length ? ` ${resolutionFailures.slice(0, 3).join("；")}` : ""
+      }`,
+    );
   }
   await startBilibiliPartsZipTask(
     {
@@ -2733,6 +2740,7 @@ async function packageBilibiliParts(tab, jobId, requestOptions = {}) {
       items: resolvedItems,
       attachments,
       selectedCount: selectedParts.length,
+      resolutionFailures,
     },
     jobId,
   );
@@ -3576,13 +3584,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       try {
         const current = await getActiveJob();
-        const filename =
-          current?.jobId === message.jobId && current.outputFilename
+        const requestedFilename = message.archiveName ||
+          (current?.jobId === message.jobId && current.outputFilename
             ? current.outputFilename
-            : message.archiveName || "STILLFRAME-001.zip";
+            : "STILLFRAME-001.zip");
+        const filename = /\.zip$/i.test(requestedFilename)
+          ? requestedFilename
+          : `${requestedFilename.replace(/\.[^.]+$/i, "")}.zip`;
         await updateActiveJob(message.jobId, {
-          percent: 97,
-          text: "分P视频 ZIP 已生成，正在创建下载…",
+          percent: message.isFinal ? 97 : Math.max(40, current?.percent || 0),
+          text: message.isFinal
+            ? "最后一个分P视频 ZIP 已生成，正在创建下载…"
+            : `第 ${message.archiveIndex || 1} 个分P ZIP 已生成，正在创建下载…`,
         });
         const downloadId = await downloadWithForcedFilename({
           url: message.objectUrl,
@@ -3593,11 +3606,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           throw new Error("Chrome 没有创建分P ZIP 下载任务。");
         }
         sendResponse({ downloaded: true, downloadId });
-        await clearActiveJob(message.jobId);
-        await notify(
-          "定格：分P视频打包完成",
-          `${message.successCount || 0} 个分P已生成 ZIP 并开始下载。`,
-        );
+        if (message.isFinal) {
+          await clearActiveJob(message.jobId);
+          const failedText = message.failedCount
+            ? `；${message.failedCount} 个失败${message.failureSummary ? `：${message.failureSummary}` : ""}`
+            : "";
+          await notify(
+            "定格：分P视频打包完成",
+            `${message.successCount || 0} 个分P已拆分为 ${message.archiveIndex || 1} 个 ZIP 并开始下载${failedText}。`,
+          );
+        } else {
+          await updateActiveJob(message.jobId, {
+            text: `第 ${message.archiveIndex || 1} 个 ZIP 已开始下载，继续处理剩余分P…`,
+          });
+        }
       } catch (error) {
         await clearActiveJob(message.jobId);
         sendResponse({

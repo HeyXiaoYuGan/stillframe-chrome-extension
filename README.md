@@ -56,6 +56,9 @@ StillFrame 是一款面向 Chrome 及 Chromium 浏览器的网页媒体提取扩
 - 识别当前页面主视频
 - 支持传统分P、选集和合集列表
 - 分P视频可单独选择或批量打包
+- 大批量分P会使用浏览器磁盘空间流式打包，并按 4 GB 自动拆分为多个 ZIP
+- 视频合并、CRC 校验和 ZIP 写入均采用磁盘流式与分块处理，避免长时间占满浏览器内存和主线程
+- 单个分P超过 700 MB 时会跳过并报告具体原因
 - 根据接口实际结果显示可用画质、音质和编码
 - 显示视频时长和预估文件大小
 - 支持下载当前视频和打包所选视频
@@ -96,3 +99,40 @@ StillFrame 主要在用户浏览器本地处理数据。设置保存在 `chrome.
 StillFrame 自有源码采用 [MIT License](LICENSE)。Mediabunny 继续适用其独立的 Mozilla Public License 2.0 条款。
 
 > StillFrame 是一款本地运行的 Chrome 网页媒体提取工具，支持图片与视频扫描、高清去重、媒体画廊、ZIP 打包、网页截图，以及 Pinterest 和 B站专用下载功能。
+
+## Features (English)
+
+StillFrame is a local-first media extraction extension for Chrome and Chromium-based browsers. It discovers, filters, previews, and saves images and videos from web pages without uploading media or browsing data to a maintainer-operated server.
+
+### Media discovery and preview
+
+- Scans images, videos, CSS background images, `srcset`, lazy-loading attributes, and common direct media URLs.
+- Detects dynamically loaded media and supports manual rescanning.
+- Removes duplicates while preferring higher-resolution sources.
+- Provides grid and masonry galleries, image zoom and drag controls, media-type filters, dimensions, and file-size information.
+
+### Downloads, archives, and screenshots
+
+- Downloads individual or selected media and supports image-only or video-only selection.
+- Creates ZIP archives in the background with progress reporting and cancellation.
+- Streams large Bilibili packages to browser storage and automatically splits output into ZIP files of up to 4 GB.
+- Processes video merging, CRC calculation, and ZIP output in chunks to reduce memory pressure and browser stalls.
+- Converts WebP images to PNG when enabled.
+- Captures the visible area or a full page as PNG, JPG, or PDF, with optional 3-second or 5-second delays.
+
+### Pinterest and Bilibili support
+
+- Prefers original Pinterest images and supports Pinterest short videos and HLS media.
+- Detects Bilibili main videos, multipart videos, episode lists, and collections.
+- Supports selectable video quality, audio quality, and codec options based on the source response.
+- Packages selected Bilibili parts and can include audio, SRT/ASS subtitles, XML danmaku, and cover images.
+- Uses the bundled Mediabunny library locally to mux Bilibili DASH video and audio tracks into MP4 files.
+- Does not bypass login, payment, membership, regional, access-control, or DRM restrictions.
+
+### Privacy and limitations
+
+- Stores settings and task state locally through Chrome storage.
+- Contains no analytics SDK, advertising SDK, or maintainer account system.
+- Does not upload browsing history, cookies, media content, or downloaded files to a maintainer server.
+- Does not provide YouTube video extraction or downloading; ordinary image scanning and screenshots remain available on YouTube pages.
+- Chrome internal pages, extension pages, encrypted media, expired signed URLs, and cross-origin-protected resources may not be downloadable.

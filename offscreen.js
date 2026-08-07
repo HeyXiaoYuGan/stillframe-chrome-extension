@@ -1,13 +1,13 @@
 import {
   ALL_FORMATS,
   BlobSource,
-  BufferTarget,
   Conversion,
   Input,
   LogLevel,
   Logging,
   Mp4OutputFormat,
   Output,
+  StreamTarget,
 } from "./vendor/mediabunny/mediabunny.min.mjs";
 
 Logging.level = LogLevel.Silent;
@@ -15,6 +15,11 @@ Logging.level = LogLevel.Silent;
 let busy = false;
 let activeJobId = "";
 let activeAbortController = null;
+
+const BILIBILI_ZIP_CHUNK_LIMIT = 4_000_000_000;
+const BILIBILI_SINGLE_PART_LIMIT = 700 * 1024 * 1024;
+const BILIBILI_ARCHIVE_CLEANUP_DELAY = 6 * 60 * 60 * 1000;
+const MEDIA_IO_CHUNK_SIZE = 4 * 1024 * 1024;
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 30000, signal) {
   const controller = new AbortController();
@@ -51,10 +56,23 @@ const CRC_TABLE = (() => {
   return table;
 })();
 
-function crc32(bytes) {
+function updateCrc32(crc, bytes) {
+  for (let index = 0; index < bytes.length; index += 1) {
+    crc = CRC_TABLE[(crc ^ bytes[index]) & 0xff] ^ (crc >>> 8);
+  }
+  return crc;
+}
+
+function yieldToBrowser() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function crc32Async(bytes, signal) {
   let crc = 0xffffffff;
-  for (const byte of bytes) {
-    crc = CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  for (let offset = 0; offset < bytes.length; offset += MEDIA_IO_CHUNK_SIZE) {
+    if (signal?.aborted) throw new Error("后台任务已取消。");
+    crc = updateCrc32(crc, bytes.subarray(offset, offset + MEDIA_IO_CHUNK_SIZE));
+    await yieldToBrowser();
   }
   return (crc ^ 0xffffffff) >>> 0;
 }
@@ -70,29 +88,29 @@ function zipDateTime(date = new Date()) {
   };
 }
 
-function localZipHeader(nameLength, size, checksum, time, date) {
+function localZipHeader(nameLength, size, checksum, time, date, streamed = false) {
   const buffer = new ArrayBuffer(30);
   const view = new DataView(buffer);
   view.setUint32(0, 0x04034b50, true);
   view.setUint16(4, 20, true);
-  view.setUint16(6, 0x0800, true);
+  view.setUint16(6, 0x0800 | (streamed ? 0x0008 : 0), true);
   view.setUint16(8, 0, true);
   view.setUint16(10, time, true);
   view.setUint16(12, date, true);
-  view.setUint32(14, checksum, true);
-  view.setUint32(18, size, true);
-  view.setUint32(22, size, true);
+  view.setUint32(14, streamed ? 0 : checksum, true);
+  view.setUint32(18, streamed ? 0 : size, true);
+  view.setUint32(22, streamed ? 0 : size, true);
   view.setUint16(26, nameLength, true);
   return new Uint8Array(buffer);
 }
 
-function centralZipHeader(nameLength, size, checksum, time, date, offset) {
+function centralZipHeader(nameLength, size, checksum, time, date, offset, streamed = false) {
   const buffer = new ArrayBuffer(46);
   const view = new DataView(buffer);
   view.setUint32(0, 0x02014b50, true);
   view.setUint16(4, 20, true);
   view.setUint16(6, 20, true);
-  view.setUint16(8, 0x0800, true);
+  view.setUint16(8, 0x0800 | (streamed ? 0x0008 : 0), true);
   view.setUint16(10, 0, true);
   view.setUint16(12, time, true);
   view.setUint16(14, date, true);
@@ -101,6 +119,16 @@ function centralZipHeader(nameLength, size, checksum, time, date, offset) {
   view.setUint32(24, size, true);
   view.setUint16(28, nameLength, true);
   view.setUint32(42, offset, true);
+  return new Uint8Array(buffer);
+}
+
+function zipDataDescriptor(size, checksum) {
+  const buffer = new ArrayBuffer(16);
+  const view = new DataView(buffer);
+  view.setUint32(0, 0x08074b50, true);
+  view.setUint32(4, checksum, true);
+  view.setUint32(8, size, true);
+  view.setUint32(12, size, true);
   return new Uint8Array(buffer);
 }
 
@@ -115,16 +143,16 @@ function endZipHeader(count, centralSize, centralOffset) {
   return new Uint8Array(buffer);
 }
 
-function buildZip(files) {
+async function buildZip(files, signal) {
   const encoder = new TextEncoder();
   const localParts = [];
   const centralParts = [];
   const { time, date } = zipDateTime();
   let offset = 0;
 
-  files.forEach((file) => {
+  for (const file of files) {
     const nameBytes = encoder.encode(file.name);
-    const checksum = crc32(file.bytes);
+    const checksum = await crc32Async(file.bytes, signal);
     const localHeader = localZipHeader(
       nameBytes.length,
       file.bytes.length,
@@ -145,7 +173,7 @@ function buildZip(files) {
       nameBytes,
     );
     offset += localHeader.length + nameBytes.length + file.bytes.length;
-  });
+  }
 
   const centralOffset = offset;
   const centralSize = centralParts.reduce((sum, part) => sum + part.length, 0);
@@ -153,6 +181,160 @@ function buildZip(files) {
     [...localParts, ...centralParts, endZipHeader(files.length, centralSize, centralOffset)],
     { type: "application/zip" },
   );
+}
+
+function sourceByteLength(source) {
+  if (source instanceof Blob) return source.size;
+  if (source instanceof ArrayBuffer) return source.byteLength;
+  if (ArrayBuffer.isView(source)) return source.byteLength;
+  throw new TypeError("不支持的媒体数据类型。");
+}
+
+async function streamSourceToWritable(source, writable, signal) {
+  let crc = 0xffffffff;
+  let bytesSinceYield = 0;
+  const writeChunk = async (chunk) => {
+    if (signal?.aborted) throw new Error("后台任务已取消。");
+    crc = updateCrc32(crc, chunk);
+    await writable.write(chunk);
+    bytesSinceYield += chunk.byteLength;
+    if (bytesSinceYield >= MEDIA_IO_CHUNK_SIZE) {
+      bytesSinceYield = 0;
+      await yieldToBrowser();
+    }
+  };
+
+  if (source instanceof Blob) {
+    const reader = source.stream().getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        await writeChunk(value);
+      }
+    } catch (error) {
+      await reader.cancel(error).catch(() => {});
+      throw error;
+    } finally {
+      reader.releaseLock();
+    }
+  } else {
+    const bytes = source instanceof Uint8Array
+      ? source
+      : new Uint8Array(source.buffer || source, source.byteOffset || 0, source.byteLength);
+    for (let offset = 0; offset < bytes.length; offset += MEDIA_IO_CHUNK_SIZE) {
+      await writeChunk(bytes.subarray(offset, offset + MEDIA_IO_CHUNK_SIZE));
+    }
+  }
+
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+async function createDiskZipWriter(jobId, archiveIndex) {
+  if (!navigator.storage?.getDirectory) {
+    throw new Error("当前 Chrome 不支持磁盘流式 ZIP，请升级浏览器后重试。");
+  }
+  const root = await navigator.storage.getDirectory();
+  const safeJobId = String(jobId || "job").replace(/[^a-zA-Z0-9_-]/g, "");
+  const tempName = `.stillframe-zip-${safeJobId}-${archiveIndex}-${Date.now()}.tmp`;
+  const handle = await root.getFileHandle(tempName, { create: true });
+  const writable = await handle.createWritable();
+  const encoder = new TextEncoder();
+  const entries = [];
+  const { time, date } = zipDateTime();
+  let offset = 0;
+  let centralSize = 0;
+  let closed = false;
+
+  const removeTempFile = async () => {
+    try {
+      await root.removeEntry(tempName);
+    } catch {
+      // The temporary archive may already have been removed.
+    }
+  };
+
+  return {
+    get entryCount() {
+      return entries.length;
+    },
+    projectedSize(name, size) {
+      const nameLength = encoder.encode(name).length;
+      return (
+        offset +
+        30 +
+        nameLength +
+        size +
+        centralSize +
+        46 +
+        nameLength +
+        16 +
+        22
+      );
+    },
+    async add(name, source, signal) {
+      if (closed) throw new Error("ZIP 写入器已关闭。");
+      const nameBytes = encoder.encode(name);
+      const size = sourceByteLength(source);
+      const localOffset = offset;
+      const header = localZipHeader(
+        nameBytes.length,
+        size,
+        0,
+        time,
+        date,
+        true,
+      );
+      await writable.write(header);
+      await writable.write(nameBytes);
+      const checksum = await streamSourceToWritable(source, writable, signal);
+      const descriptor = zipDataDescriptor(size, checksum);
+      await writable.write(descriptor);
+      offset += header.length + nameBytes.length + size + descriptor.length;
+      centralSize += 46 + nameBytes.length;
+      entries.push({
+        nameBytes,
+        size,
+        checksum,
+        offset: localOffset,
+      });
+    },
+    async finalize() {
+      if (closed) throw new Error("ZIP 写入器已关闭。");
+      const centralOffset = offset;
+      for (const entry of entries) {
+        const header = centralZipHeader(
+          entry.nameBytes.length,
+          entry.size,
+          entry.checksum,
+          time,
+          date,
+          entry.offset,
+          true,
+        );
+        await writable.write(header);
+        await writable.write(entry.nameBytes);
+        offset += header.length + entry.nameBytes.length;
+      }
+      await writable.write(endZipHeader(entries.length, centralSize, centralOffset));
+      await writable.close();
+      closed = true;
+      const storedFile = await handle.getFile();
+      const file = storedFile.slice(0, storedFile.size, "application/zip");
+      return { file, removeTempFile };
+    },
+    async discard() {
+      if (!closed) {
+        try {
+          await writable.abort();
+        } catch {
+          // Ignore an already closed writer.
+        }
+        closed = true;
+      }
+      await removeTempFile();
+    },
+  };
 }
 
 function sendProgress(jobId, percent, text) {
@@ -457,7 +639,7 @@ async function runZipJob(message) {
     }
 
     sendProgress(message.jobId, 86, "后台正在生成 ZIP…");
-    const zipBlob = buildZip(files);
+    const zipBlob = await buildZip(files, activeAbortController.signal);
     const objectUrl = URL.createObjectURL(zipBlob);
     setTimeout(() => URL.revokeObjectURL(objectUrl), 120000);
 
@@ -477,7 +659,7 @@ async function runZipJob(message) {
   }
 }
 
-async function fetchFirstMediaBytes(urls, label, signal) {
+async function fetchFirstMediaBlob(urls, label, signal) {
   let lastError;
   for (const url of [...new Set((urls || []).filter(Boolean))]) {
     try {
@@ -490,7 +672,7 @@ async function fetchFirstMediaBytes(urls, label, signal) {
       if (/text|html|json/i.test(contentType)) {
         throw new Error("CDN 返回了文本错误页");
       }
-      return new Uint8Array(await response.arrayBuffer());
+      return await response.blob();
     } catch (error) {
       lastError = error;
       if (signal?.aborted) throw new Error("后台任务已取消。");
@@ -499,106 +681,147 @@ async function fetchFirstMediaBytes(urls, label, signal) {
   throw new Error(`${label}读取失败：${lastError?.message || "没有可用 CDN"}`);
 }
 
+async function createTemporaryMediaTarget(jobId) {
+  if (!navigator.storage?.getDirectory) {
+    throw new Error("当前 Chrome 不支持磁盘流式视频合并，请升级浏览器后重试。");
+  }
+  const root = await navigator.storage.getDirectory();
+  const safeJobId = String(jobId || "job").replace(/[^a-zA-Z0-9_-]/g, "");
+  const tempName = `.stillframe-media-${safeJobId}-${Date.now()}.mp4.tmp`;
+  const handle = await root.getFileHandle(tempName, { create: true });
+  const writable = await handle.createWritable();
+  const removeTempFile = async () => {
+    try {
+      await root.removeEntry(tempName);
+    } catch {
+      // The temporary media file may already have been removed.
+    }
+  };
+  return { handle, writable, removeTempFile };
+}
+
 async function muxDashMedia(
-  videoBytes,
-  audioBytes,
+  videoSource,
+  audioSource,
   jobId,
   signal,
   onProgress = null,
 ) {
-  const hasAudio = Boolean(audioBytes?.length);
-  if (videoBytes.length + (audioBytes?.length || 0) > 1024 * 1024 * 1024) {
+  const hasAudio = Boolean(audioSource && sourceByteLength(audioSource));
+  if (sourceByteLength(videoSource) + (hasAudio ? sourceByteLength(audioSource) : 0) > 1024 * 1024 * 1024) {
     throw new Error("视频和音频总大小超过 1 GB，浏览器内存不足以安全合并。");
   }
+  const videoBlob = videoSource instanceof Blob
+    ? videoSource
+    : new Blob([videoSource], { type: "video/mp4" });
+  const audioBlob = hasAudio
+    ? audioSource instanceof Blob
+      ? audioSource
+      : new Blob([audioSource], { type: "audio/mp4" })
+    : null;
   const videoInput = new Input({
-    source: new BlobSource(new Blob([videoBytes], { type: "video/mp4" })),
+    source: new BlobSource(videoBlob),
     formats: ALL_FORMATS,
   });
-  const target = new BufferTarget();
+  const temporaryTarget = await createTemporaryMediaTarget(jobId);
+  const target = new StreamTarget(temporaryTarget.writable, {
+    chunked: true,
+    chunkSize: MEDIA_IO_CHUNK_SIZE,
+  });
   const output = new Output({
     format: new Mp4OutputFormat(),
     target,
   });
-  const videoConversion = await Conversion.init({
-    input: videoInput,
-    output,
-    composable: true,
-    video: { forceTranscode: false },
-    audio: { discard: true },
-    showWarnings: false,
-  });
-  const audioConversion = hasAudio
-    ? await Conversion.init({
-        input: new Input({
-          source: new BlobSource(new Blob([audioBytes], { type: "audio/mp4" })),
-          formats: ALL_FORMATS,
-        }),
-        output,
-        composable: true,
-        video: { discard: true },
-        audio: { forceTranscode: false },
-        showWarnings: false,
-      })
-    : null;
-  if (!videoConversion.utilizedTracks.length) {
-    throw new Error("视频 m4s 中没有可封装的视频轨。");
-  }
-  if (audioConversion && !audioConversion.utilizedTracks.length) {
-    throw new Error("音频 m4s 中没有可封装的音频轨。");
-  }
-  let videoProgress = 0;
-  let audioProgress = hasAudio ? 0 : 1;
-  const reportProgress = () => {
-    const combinedProgress = hasAudio
-      ? (videoProgress + audioProgress) / 2
-      : videoProgress;
-    if (typeof onProgress === "function") {
-      onProgress(combinedProgress);
-      return;
+  let videoConversion;
+  let audioConversion;
+  try {
+    videoConversion = await Conversion.init({
+      input: videoInput,
+      output,
+      composable: true,
+      video: { forceTranscode: false },
+      audio: { discard: true },
+      showWarnings: false,
+    });
+    audioConversion = hasAudio
+      ? await Conversion.init({
+          input: new Input({
+            source: new BlobSource(audioBlob),
+            formats: ALL_FORMATS,
+          }),
+          output,
+          composable: true,
+          video: { discard: true },
+          audio: { forceTranscode: false },
+          showWarnings: false,
+        })
+      : null;
+    if (!videoConversion.utilizedTracks.length) {
+      throw new Error("视频 m4s 中没有可封装的视频轨。");
     }
-    const percent = 52 + Math.round(combinedProgress * 42);
-    chrome.runtime
-      .sendMessage({
-        type: "DINGGE_DASH_MUX_PROGRESS",
-        target: "background",
-        jobId,
-        percent,
-        text: `正在无损合并视频与音频… ${Math.round(
-          combinedProgress * 100,
-        )}%`,
-      })
-      .catch(() => {});
-  };
-  videoConversion.onProgress = (progress) => {
-    videoProgress = progress;
-    reportProgress();
-  };
-  if (audioConversion) {
-    audioConversion.onProgress = (progress) => {
-      audioProgress = progress;
+    if (audioConversion && !audioConversion.utilizedTracks.length) {
+      throw new Error("音频 m4s 中没有可封装的音频轨。");
+    }
+    let videoProgress = 0;
+    let audioProgress = hasAudio ? 0 : 1;
+    const reportProgress = () => {
+      const combinedProgress = hasAudio
+        ? (videoProgress + audioProgress) / 2
+        : videoProgress;
+      if (typeof onProgress === "function") {
+        onProgress(combinedProgress);
+        return;
+      }
+      const percent = 52 + Math.round(combinedProgress * 42);
+      chrome.runtime
+        .sendMessage({
+          type: "DINGGE_DASH_MUX_PROGRESS",
+          target: "background",
+          jobId,
+          percent,
+          text: `正在无损合并视频与音频… ${Math.round(
+            combinedProgress * 100,
+          )}%`,
+        })
+        .catch(() => {});
+    };
+    videoConversion.onProgress = (progress) => {
+      videoProgress = progress;
       reportProgress();
     };
-  }
-  const cancelConversions = () => {
-    videoConversion.cancel().catch(() => {});
-    audioConversion?.cancel().catch(() => {});
-  };
-  signal?.addEventListener("abort", cancelConversions, { once: true });
-  try {
+    if (audioConversion) {
+      audioConversion.onProgress = (progress) => {
+        audioProgress = progress;
+        reportProgress();
+      };
+    }
+    const cancelConversions = () => {
+      videoConversion.cancel().catch(() => {});
+      audioConversion?.cancel().catch(() => {});
+    };
+    signal?.addEventListener("abort", cancelConversions, { once: true });
     await output.start();
-    await Promise.all(
-      [videoConversion, audioConversion]
-        .filter(Boolean)
-        .map((conversion) => conversion.execute()),
-    );
-    await output.finalize();
-  } finally {
-    signal?.removeEventListener("abort", cancelConversions);
+    try {
+      await Promise.all(
+        [videoConversion, audioConversion]
+          .filter(Boolean)
+          .map((conversion) => conversion.execute()),
+      );
+      await output.finalize();
+    } finally {
+      signal?.removeEventListener("abort", cancelConversions);
+    }
+    const storedFile = await temporaryTarget.handle.getFile();
+    if (!storedFile.size) throw new Error("无损合并没有生成有效的 MP4 文件。");
+    const file = storedFile.slice(0, storedFile.size, "video/mp4");
+    return { file, removeTempFile: temporaryTarget.removeTempFile };
+  } catch (error) {
+    videoConversion?.cancel().catch(() => {});
+    audioConversion?.cancel().catch(() => {});
+    await output.cancel().catch(() => {});
+    await temporaryTarget.removeTempFile();
+    throw error;
   }
-  if (!target.buffer?.byteLength) {
-    throw new Error("无损合并没有生成有效的 MP4 文件。");
-  }
-  return target.buffer;
 }
 
 async function runDashMuxJob(message) {
@@ -606,6 +829,7 @@ async function runDashMuxJob(message) {
   busy = true;
   activeJobId = message.jobId;
   activeAbortController = new AbortController();
+  let muxedMedia = null;
   try {
     chrome.runtime
       .sendMessage({
@@ -616,7 +840,7 @@ async function runDashMuxJob(message) {
         text: "正在读取高画质视频流…",
       })
       .catch(() => {});
-    const videoBytes = await fetchFirstMediaBytes(
+    const videoBlob = await fetchFirstMediaBlob(
       message.videoUrls,
       "视频流",
       activeAbortController.signal,
@@ -630,30 +854,45 @@ async function runDashMuxJob(message) {
         text: "视频流读取完成，正在读取音频流…",
       })
       .catch(() => {});
-    const audioBytes = await fetchFirstMediaBytes(
+    const audioBlob = await fetchFirstMediaBlob(
       message.audioUrls,
       "音频流",
       activeAbortController.signal,
     );
-    const buffer = await muxDashMedia(
-      videoBytes,
-      audioBytes,
+    muxedMedia = await muxDashMedia(
+      videoBlob,
+      audioBlob,
       message.jobId,
       activeAbortController.signal,
     );
-    const objectUrl = URL.createObjectURL(new Blob([buffer], { type: "video/mp4" }));
-    setTimeout(() => URL.revokeObjectURL(objectUrl), 120000);
-    const response = await chrome.runtime.sendMessage({
-      type: "DINGGE_DASH_MUX_READY",
-      target: "background",
-      jobId: message.jobId,
-      objectUrl,
-      filename: message.filename,
-    });
-    if (!response?.downloaded) {
-      throw new Error(response?.error || "Chrome 无法创建合并后的视频下载。");
+    const objectUrl = URL.createObjectURL(muxedMedia.file);
+    let downloadStarted = false;
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "DINGGE_DASH_MUX_READY",
+        target: "background",
+        jobId: message.jobId,
+        objectUrl,
+        filename: message.filename,
+      });
+      if (!response?.downloaded) {
+        throw new Error(response?.error || "Chrome 无法创建合并后的视频下载。");
+      }
+      downloadStarted = true;
+    } finally {
+      if (downloadStarted) {
+        const completedMedia = muxedMedia;
+        setTimeout(() => {
+          URL.revokeObjectURL(objectUrl);
+          completedMedia.removeTempFile().catch(() => {});
+        }, BILIBILI_ARCHIVE_CLEANUP_DELAY);
+        muxedMedia = null;
+      } else {
+        URL.revokeObjectURL(objectUrl);
+      }
     }
   } finally {
+    await muxedMedia?.removeTempFile();
     busy = false;
     activeJobId = "";
     activeAbortController = null;
@@ -665,11 +904,71 @@ async function runBilibiliPartsZipJob(message) {
   busy = true;
   activeJobId = message.jobId;
   activeAbortController = new AbortController();
-  const files = [];
-  let totalBytes = 0;
+  let zipWriter = null;
   let successCount = 0;
+  let archiveCount = 0;
+  const failures = Array.isArray(message.resolutionFailures)
+    ? message.resolutionFailures.map(String)
+    : [];
   const items = (Array.isArray(message.items) ? message.items : []).slice(0, 50);
+  const selectedCount = Math.max(items.length, Number(message.selectedCount) || 0);
+
+  const archiveFilename = (index, isOnlyArchive = false) => {
+    const original = String(message.archiveName || "STILLFRAME-001.zip");
+    if (isOnlyArchive) return original;
+    return `${original.replace(/\.zip$/i, "")}-part-${String(index).padStart(2, "0")}.zip`;
+  };
+
+  const downloadArchive = async (isFinal = false) => {
+    if (!zipWriter?.entryCount) return;
+    const completedWriter = zipWriter;
+    zipWriter = null;
+    archiveCount += 1;
+    let completedArchive;
+    try {
+      completedArchive = await completedWriter.finalize();
+    } catch (error) {
+      await completedWriter.discard();
+      throw error;
+    }
+    const objectUrl = URL.createObjectURL(completedArchive.file);
+    const filename = archiveFilename(archiveCount, isFinal && archiveCount === 1);
+    let downloadStarted = false;
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "DINGGE_BILIBILI_PARTS_ZIP_READY",
+        target: "background",
+        jobId: message.jobId,
+        objectUrl,
+        archiveName: filename,
+        archiveIndex: archiveCount,
+        isFinal,
+        successCount,
+        failedCount: selectedCount - successCount,
+        failureSummary: failures.slice(0, 3).join("；"),
+      });
+      if (!response?.downloaded) {
+        throw new Error(response?.error || `Chrome 无法创建第 ${archiveCount} 个分P ZIP 下载。`);
+      }
+      downloadStarted = true;
+    } finally {
+      if (downloadStarted) {
+        setTimeout(() => {
+          URL.revokeObjectURL(objectUrl);
+          completedArchive.removeTempFile().catch(() => {});
+        }, BILIBILI_ARCHIVE_CLEANUP_DELAY);
+      } else {
+        URL.revokeObjectURL(objectUrl);
+        await completedArchive.removeTempFile();
+      }
+    }
+    if (!isFinal) {
+      zipWriter = await createDiskZipWriter(message.jobId, archiveCount + 1);
+    }
+  };
+
   try {
+    zipWriter = await createDiskZipWriter(message.jobId, 1);
     for (const [index, item] of items.entries()) {
       if (activeAbortController.signal.aborted) {
         throw new Error("后台任务已取消。");
@@ -684,51 +983,51 @@ async function runBilibiliPartsZipJob(message) {
           text: `正在处理分P ${index + 1}/${items.length}：${item.title || item.name}`,
         })
         .catch(() => {});
+      let temporaryMedia = null;
       try {
-        let bytes;
+        let source;
         if (item.videoUrls?.length) {
-          const videoBytes = await fetchFirstMediaBytes(
+          const videoBlob = await fetchFirstMediaBlob(
             item.videoUrls,
             `分P ${index + 1} 视频流`,
             activeAbortController.signal,
           );
           if (item.needsMux) {
-            const audioBytes = item.audioUrls?.length
-              ? await fetchFirstMediaBytes(
+            const audioBlob = item.audioUrls?.length
+              ? await fetchFirstMediaBlob(
                   item.audioUrls,
                   `分P ${index + 1} 音频流`,
                   activeAbortController.signal,
                 )
               : null;
-            bytes = new Uint8Array(
-              await muxDashMedia(
-                videoBytes,
-                audioBytes,
-                message.jobId,
-                activeAbortController.signal,
-                (progress) => {
-                  chrome.runtime
-                    .sendMessage({
-                      type: "DINGGE_BILIBILI_PARTS_ZIP_PROGRESS",
-                      target: "background",
-                      jobId: message.jobId,
-                      percent:
-                        startPercent +
-                        Math.round((50 / items.length) * progress),
-                      text: `正在无损合并分P ${index + 1}/${items.length}… ${Math.round(progress * 100)}%`,
-                    })
-                    .catch(() => {});
-                },
-              ),
+            temporaryMedia = await muxDashMedia(
+              videoBlob,
+              audioBlob,
+              message.jobId,
+              activeAbortController.signal,
+              (progress) => {
+                chrome.runtime
+                  .sendMessage({
+                    type: "DINGGE_BILIBILI_PARTS_ZIP_PROGRESS",
+                    target: "background",
+                    jobId: message.jobId,
+                    percent:
+                      startPercent +
+                      Math.round((50 / items.length) * progress),
+                    text: `正在无损合并分P ${index + 1}/${items.length}… ${Math.round(progress * 100)}%`,
+                  })
+                  .catch(() => {});
+              },
             );
+            source = temporaryMedia.file;
           } else {
-            bytes = videoBytes;
+            source = videoBlob;
           }
         } else if (item.hlsUrls?.length) {
           let lastError;
           for (const hlsUrl of item.hlsUrls) {
             try {
-              bytes = (
+              source = (
                 await fetchHlsVideo(
                   hlsUrl,
                   () => {},
@@ -740,19 +1039,41 @@ async function runBilibiliPartsZipJob(message) {
               lastError = error;
             }
           }
-          if (!bytes) throw lastError || new Error("没有可用的 HLS 视频流。");
+          if (!source) throw lastError || new Error("没有可用的 HLS 视频流。");
         }
-        if (!bytes?.length) throw new Error("该分P没有返回可打包的视频数据。");
-        totalBytes += bytes.length;
-        if (totalBytes > 800 * 1024 * 1024) {
-          throw new Error("所选分P合计超过 800 MB，浏览器内存不足以安全生成 ZIP。");
+        const sourceSize = source ? sourceByteLength(source) : 0;
+        if (!sourceSize) throw new Error("该分P没有返回可打包的视频数据。");
+        if (sourceSize > BILIBILI_SINGLE_PART_LIMIT) {
+          throw new Error("单个分P超过 700 MB，浏览器内存不足以安全生成 ZIP。");
         }
-        files.push({ name: replaceExtension(item.name, "mp4"), bytes });
+        const outputName = replaceExtension(item.name, "mp4");
+        if (
+          zipWriter.entryCount &&
+          zipWriter.projectedSize(outputName, sourceSize) > BILIBILI_ZIP_CHUNK_LIMIT
+        ) {
+          chrome.runtime
+            .sendMessage({
+              type: "DINGGE_BILIBILI_PARTS_ZIP_PROGRESS",
+              target: "background",
+              jobId: message.jobId,
+              percent: startPercent,
+              text: `当前 ZIP 已达到安全容量，正在下载第 ${archiveCount + 1} 包…`,
+            })
+            .catch(() => {});
+          await downloadArchive(false);
+        }
+        if (zipWriter.projectedSize(outputName, sourceSize) > BILIBILI_ZIP_CHUNK_LIMIT) {
+          throw new Error("单个分P无法放入 4 GB ZIP。");
+        }
+        await zipWriter.add(outputName, source, activeAbortController.signal);
         successCount += 1;
       } catch (error) {
         if (activeAbortController.signal.aborted) throw error;
-        if (error?.message?.includes("800 MB")) throw error;
-        // Skip an unavailable part and continue with the remaining selection.
+        failures.push(
+          `${item.title || item.name || `分P ${index + 1}`}：${error?.message || "读取或合并失败"}`,
+        );
+      } finally {
+        await temporaryMedia?.removeTempFile();
       }
     }
 
@@ -760,9 +1081,9 @@ async function runBilibiliPartsZipJob(message) {
       ? message.attachments
       : []) {
       try {
-        let bytes;
+        let source;
         if (typeof attachment.text === "string") {
-          bytes = new TextEncoder().encode(attachment.text);
+          source = new TextEncoder().encode(attachment.text);
         } else if (/^https?:/i.test(attachment.url || "")) {
           const response = await fetchWithTimeout(
             attachment.url,
@@ -771,19 +1092,32 @@ async function runBilibiliPartsZipJob(message) {
             activeAbortController.signal,
           );
           if (!response.ok) continue;
-          bytes = new Uint8Array(await response.arrayBuffer());
+          source = await response.blob();
         }
-        if (!bytes?.length) continue;
-        totalBytes += bytes.length;
-        if (totalBytes > 800 * 1024 * 1024) break;
-        files.push({ name: attachment.name, bytes });
+        const sourceSize = source ? sourceByteLength(source) : 0;
+        if (!sourceSize) continue;
+        if (sourceSize > BILIBILI_SINGLE_PART_LIMIT) continue;
+        if (
+          zipWriter.entryCount &&
+          zipWriter.projectedSize(attachment.name, sourceSize) >
+            BILIBILI_ZIP_CHUNK_LIMIT
+        ) {
+          await downloadArchive(false);
+        }
+        if (
+          zipWriter.projectedSize(attachment.name, sourceSize) >
+          BILIBILI_ZIP_CHUNK_LIMIT
+        ) continue;
+        await zipWriter.add(attachment.name, source, activeAbortController.signal);
       } catch {
         // Optional attachments do not stop the video ZIP.
       }
     }
 
     if (!successCount) {
-      throw new Error("所选分P均无法读取或合并。");
+      throw new Error(
+        `所选分P均无法读取或合并。${failures.length ? ` ${failures.slice(0, 3).join("；")}` : ""}`,
+      );
     }
     chrome.runtime
       .sendMessage({
@@ -794,21 +1128,9 @@ async function runBilibiliPartsZipJob(message) {
         text: "正在生成分P视频 ZIP…",
       })
       .catch(() => {});
-    const objectUrl = URL.createObjectURL(buildZip(files));
-    setTimeout(() => URL.revokeObjectURL(objectUrl), 120000);
-    const response = await chrome.runtime.sendMessage({
-      type: "DINGGE_BILIBILI_PARTS_ZIP_READY",
-      target: "background",
-      jobId: message.jobId,
-      objectUrl,
-      archiveName: message.archiveName,
-      successCount,
-      failedCount: items.length - successCount,
-    });
-    if (!response?.downloaded) {
-      throw new Error(response?.error || "Chrome 无法创建分P ZIP 下载。");
-    }
+    await downloadArchive(true);
   } finally {
+    await zipWriter?.discard();
     busy = false;
     activeJobId = "";
     activeAbortController = null;

@@ -34,6 +34,7 @@ const state = {
 };
 const pendingImageMeasurements = new Map();
 let imageMeasurementGeneration = 0;
+const BILIBILI_ZIP_CHUNK_LIMIT = 4_000_000_000;
 
 const elements = {
   versionLabel: document.querySelector("#versionLabel"),
@@ -540,6 +541,7 @@ function updateBilibiliPartSizes(placeholder = "大小待识别") {
         ? formatBiliSize(size.sizeBytes, size.estimated)
         : placeholder;
     });
+  updateBiliSelectionUI();
 }
 
 async function refreshBilibiliPartSizes() {
@@ -574,9 +576,22 @@ function updateBiliSelectionUI() {
   const listLabel = state.biliListKind === "season" ? "视频" : "分P";
   const limitLabel =
     state.biliParts.length > 50 ? " · 当前选择上限 50 个" : "";
+  const selectedSizes = [...state.selectedBiliCids]
+    .map((cid) => state.biliPartSizes.get(Number(cid)))
+    .filter((size) => Number(size?.sizeBytes) > 0);
+  const selectedBytes = selectedSizes.reduce(
+    (total, size) => total + Number(size.sizeBytes || 0),
+    0,
+  );
+  const sizeLabel = selectedBytes
+    ? ` · ${selectedSizes.length === selectedCount ? "预计" : "已识别"}${formatBiliSize(selectedBytes, false)}`
+    : "";
+  const splitLabel = selectedBytes > BILIBILI_ZIP_CHUNK_LIMIT
+    ? " · 将自动拆分 ZIP"
+    : "";
   elements.biliPartSummary.textContent = state.biliParts.length > 1
-    ? `共 ${state.biliParts.length} 个${listLabel}${limitLabel} · 已选 ${selectedCount}`
-    : `主视频 · 已选 ${selectedCount}`;
+    ? `共 ${state.biliParts.length} 个${listLabel}${limitLabel} · 已选 ${selectedCount}${sizeLabel}${splitLabel}`
+    : `主视频 · 已选 ${selectedCount}${sizeLabel}`;
   elements.biliSelectAllButton.textContent =
     selectedCount === selectableCount ? "取消全选" : "全选";
   elements.biliPackageSelectedButton.textContent = selectedCount
