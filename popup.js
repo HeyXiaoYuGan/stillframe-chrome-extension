@@ -31,6 +31,8 @@ const state = {
   biliListKind: "single",
   biliPartSizes: new Map(),
   biliSizeRequestId: 0,
+  douyinVideo: null,
+  douyinQualityChoices: [],
 };
 const pendingImageMeasurements = new Map();
 let imageMeasurementGeneration = 0;
@@ -43,6 +45,21 @@ const elements = {
   featureTabs: [...document.querySelectorAll(".feature-tab")],
   imagesPanel: document.querySelector("#imagesPanel"),
   screenshotPanel: document.querySelector("#screenshotPanel"),
+  douyinPanel: document.querySelector("#douyinPanel"),
+  douyinScanButton: document.querySelector("#douyinScanButton"),
+  douyinScanButtonText: document.querySelector("#douyinScanButtonText"),
+  douyinResults: document.querySelector("#douyinResults"),
+  douyinEmptyHint: document.querySelector("#douyinEmptyHint"),
+  douyinCover: document.querySelector("#douyinCover"),
+  douyinVideoTitle: document.querySelector("#douyinVideoTitle"),
+  douyinVideoAuthor: document.querySelector("#douyinVideoAuthor"),
+  douyinVideoMeta: document.querySelector("#douyinVideoMeta"),
+  douyinQuality: document.querySelector("#douyinQuality"),
+  douyinCodecField: document.querySelector("#douyinCodecField"),
+  douyinCodec: document.querySelector("#douyinCodec"),
+  douyinCoverOption: document.querySelector("#douyinCoverOption"),
+  douyinDownloadCover: document.querySelector("#douyinDownloadCover"),
+  douyinDownloadButton: document.querySelector("#douyinDownloadButton"),
   bilibiliPanel: document.querySelector("#bilibiliPanel"),
   biliScanButton: document.querySelector("#biliScanButton"),
   biliScanButtonText: document.querySelector("#biliScanButtonText"),
@@ -283,6 +300,12 @@ function setBusy(busy) {
   state.busy = busy;
   elements.scanButton.disabled = busy;
   elements.captureButton.disabled = busy;
+  elements.douyinScanButton.disabled = busy;
+  elements.douyinDownloadButton.disabled = busy || !state.douyinVideo;
+  elements.douyinQuality.disabled = busy || !state.douyinQualityChoices.length;
+  elements.douyinCodec.disabled =
+    busy || elements.douyinCodecField.hidden || elements.douyinCodec.options.length <= 1;
+  elements.douyinDownloadCover.disabled = busy || elements.douyinCoverOption.hidden;
   elements.biliScanButton.disabled = busy;
   elements.biliDownloadCurrentButton.disabled =
     busy || state.biliParts.length === 0;
@@ -349,6 +372,7 @@ async function initialize() {
     "preferOriginalPreview",
     "previewLayout",
     "imageFilterLevel",
+    "douyinDownloadCover",
     "biliQuality",
     "biliAudioQuality",
     "biliCodec",
@@ -359,7 +383,7 @@ async function initialize() {
     "biliDownloadDanmaku",
   ]);
   state.mode = preferences.mode === "full" ? "full" : "visible";
-  state.feature = ["images", "screenshot", "bilibili"].includes(
+  state.feature = ["images", "screenshot", "douyin", "bilibili"].includes(
     preferences.feature,
   )
     ? preferences.feature
@@ -377,6 +401,7 @@ async function initialize() {
     preferences.imageFilterLevel,
   );
   elements.imageFilterLevelSelect.value = state.imageFilterLevel;
+  elements.douyinDownloadCover.checked = preferences.douyinDownloadCover === true;
   elements.biliQuality.value = String(preferences.biliQuality || "80");
   elements.biliAudioQuality.value = String(
     preferences.biliAudioQuality || "30280",
@@ -404,6 +429,8 @@ async function initialize() {
     } else {
       if (state.feature === "bilibili") {
         await scanBilibiliVideos();
+      } else if (state.feature === "douyin") {
+        await scanDouyinVideo();
       } else {
         await syncImagesFromPage();
         await syncNetworkMedia();
@@ -506,6 +533,230 @@ function isBilibiliPage(url = state.tab?.url || "") {
     return /(^|\.)bilibili\.com$/i.test(new URL(url).hostname);
   } catch {
     return false;
+  }
+}
+
+function isDouyinPage(url = state.tab?.url || "") {
+  try {
+    const hostname = new URL(url).hostname;
+    return hostname === "douyin.com" || hostname.endsWith(".douyin.com");
+  } catch {
+    return false;
+  }
+}
+
+async function requestDouyinVideo() {
+  return chrome.runtime.sendMessage({
+    type: "DINGGE_GET_DOUYIN_VIDEO",
+    target: "background",
+    tabId: state.tab.id,
+  });
+}
+
+function formatDouyinDuration(rawSeconds) {
+  const seconds = Math.max(0, Math.round(Number(rawSeconds) || 0));
+  if (!seconds) return "";
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return `${minutes}:${String(remainder).padStart(2, "0")}`;
+}
+
+function normalizeDouyinCodec(value) {
+  const normalized = String(value || "").trim().toUpperCase();
+  return ["AVC", "HEVC", "AV1"].includes(normalized) ? normalized : "";
+}
+
+function douyinQualityChoices(video, requestedCodec = "") {
+  const allCandidates = Array.isArray(video?.candidates) ? video.candidates : [];
+  const selectable = allCandidates
+    .map((candidate, index) => ({ candidate, index }))
+    .filter(({ candidate }) => candidate.selectable === true);
+  const normalizedCodec = normalizeDouyinCodec(requestedCodec);
+  const codecMatches = normalizedCodec
+    ? selectable.filter(
+        ({ candidate }) => normalizeDouyinCodec(candidate.codec) === normalizedCodec,
+      )
+    : selectable;
+  const source = codecMatches.length
+    ? codecMatches
+    : selectable.length
+    ? selectable
+    : allCandidates.slice(0, 1).map((candidate, index) => ({ candidate, index }));
+  const seen = new Set();
+  return source.filter(({ candidate }) => {
+    const key =
+      candidate.qualityKey ||
+      [
+        Number(candidate.width) || 0,
+        Number(candidate.height) || 0,
+        Number(candidate.bitRate) || 0,
+        Number(candidate.fps) || 0,
+        candidate.codec || "",
+        candidate.hdr ? "hdr" : "sdr",
+      ].join(":");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function updateDouyinQualityOptions() {
+  const previous = state.douyinVideo?.candidates?.[
+    Number(elements.douyinQuality.value) || 0
+  ];
+  const codec = elements.douyinCodecField.hidden ? "" : elements.douyinCodec.value;
+  state.douyinQualityChoices = douyinQualityChoices(state.douyinVideo, codec);
+  elements.douyinQuality.replaceChildren();
+  state.douyinQualityChoices.forEach(({ candidate, index }) => {
+    const option = document.createElement("option");
+    option.value = String(index);
+    option.textContent = candidate.label || `可用播放地址 ${index + 1}`;
+    elements.douyinQuality.append(option);
+  });
+  const previousChoice = state.douyinQualityChoices.find(
+    ({ candidate }) => candidate.qualityKey === previous?.qualityKey,
+  );
+  if (previousChoice) elements.douyinQuality.value = String(previousChoice.index);
+  elements.douyinQuality.disabled = state.busy || !state.douyinQualityChoices.length;
+  updateDouyinVideoMeta();
+}
+
+function updateDouyinVideoMeta() {
+  if (!state.douyinVideo) return;
+  const selected = state.douyinVideo.candidates[
+    Number(elements.douyinQuality.value) || 0
+  ];
+  const dimensions =
+    selected?.width && selected?.height
+      ? `${selected.width} × ${selected.height}`
+      : "当前播放流";
+  const duration = formatDouyinDuration(state.douyinVideo.duration);
+  const qualityCount = state.douyinQualityChoices.length;
+  elements.douyinVideoMeta.textContent = [
+    dimensions,
+    duration,
+    qualityCount > 1 ? `${qualityCount} 档可用画质` : "1 档可用画质",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function renderDouyinVideo(video) {
+  state.douyinVideo = video?.candidates?.length ? video : null;
+  elements.douyinResults.hidden = !state.douyinVideo;
+  elements.douyinEmptyHint.hidden = Boolean(state.douyinVideo);
+  elements.douyinQuality.replaceChildren();
+  elements.douyinCodec.replaceChildren();
+  elements.douyinCodecField.hidden = true;
+  elements.douyinCoverOption.hidden = true;
+  state.douyinQualityChoices = [];
+  if (!state.douyinVideo) {
+    elements.douyinCover.removeAttribute("src");
+    elements.douyinQuality.disabled = true;
+    elements.douyinCodec.disabled = true;
+    elements.douyinDownloadCover.disabled = true;
+    elements.douyinDownloadButton.disabled = true;
+    return;
+  }
+
+  elements.douyinVideoTitle.textContent = video.title || "当前抖音视频";
+  elements.douyinVideoAuthor.textContent = video.author
+    ? `@${video.author}`
+    : "作者未知";
+  if (video.cover) {
+    elements.douyinCover.src = video.cover;
+    elements.douyinCover.hidden = false;
+  } else {
+    elements.douyinCover.removeAttribute("src");
+    elements.douyinCover.hidden = true;
+  }
+  elements.douyinCoverOption.hidden = !video.cover;
+  elements.douyinDownloadCover.disabled = state.busy || !video.cover;
+  const allChoices = douyinQualityChoices(video);
+  const codecs = [
+    ...new Set(allChoices.map(({ candidate }) => normalizeDouyinCodec(candidate.codec))),
+  ].filter(Boolean);
+  const codecsAreComplete =
+    allChoices.length > 0 &&
+    allChoices.every(({ candidate }) => normalizeDouyinCodec(candidate.codec));
+  if (codecsAreComplete && codecs.length) {
+    codecs.forEach((codec) => {
+      const option = document.createElement("option");
+      option.value = codec;
+      option.textContent = codec;
+      elements.douyinCodec.append(option);
+    });
+    elements.douyinCodec.value = normalizeDouyinCodec(allChoices[0].candidate.codec);
+    elements.douyinCodecField.hidden = false;
+    elements.douyinCodec.disabled = state.busy || codecs.length <= 1;
+  }
+  updateDouyinQualityOptions();
+  elements.douyinDownloadButton.disabled = state.busy;
+}
+
+async function scanDouyinVideo() {
+  if (state.busy) return;
+  state.tab = await getActiveTab();
+  state.pageUrl = state.tab?.url || "";
+  if (!state.tab?.id || !isDouyinPage(state.tab.url)) {
+    renderDouyinVideo(null);
+    showMessage("请先打开一个网页版抖音视频页面。", "error");
+    return;
+  }
+  setBusy(true);
+  showMessage("");
+  elements.douyinScanButtonText.textContent = "正在识别当前抖音视频…";
+  try {
+    const response = await requestDouyinVideo();
+    if (!response?.ok || !response.video?.candidates?.length) {
+      throw new Error(
+        response?.error || "没有读取到可下载的视频地址，请先播放视频几秒后重试。",
+      );
+    }
+    renderDouyinVideo(response.video);
+    elements.douyinScanButtonText.textContent = "重新识别当前抖音视频";
+    showMessage(
+      `已识别“${response.video.title || "当前抖音视频"}”，请选择画质下载。`,
+      "success",
+    );
+  } catch (error) {
+    renderDouyinVideo(null);
+    elements.douyinScanButtonText.textContent = "识别当前抖音视频";
+    showMessage(error?.message || "抖音视频识别失败。", "error");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function startDouyinDownload() {
+  if (state.busy || !state.tab?.id || !state.douyinVideo) return;
+  setBusy(true);
+  showMessage("");
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "DINGGE_START_DOUYIN_DOWNLOAD",
+      target: "background",
+      tabId: state.tab.id,
+      video: state.douyinVideo,
+      preferredIndex: Number(elements.douyinQuality.value) || 0,
+      downloadCover:
+        !elements.douyinCoverOption.hidden && elements.douyinDownloadCover.checked,
+    });
+    if (!response?.started) {
+      throw new Error(response?.error || "无法启动抖音视频下载。");
+    }
+    showMessage(
+      response.coverDownloaded
+        ? "抖音视频和封面已交给 Chrome 下载管理器。"
+        : response.coverRequested
+          ? "抖音视频已开始下载，但封面下载失败。"
+        : "抖音视频已交给 Chrome 下载管理器。",
+      "success",
+    );
+  } catch (error) {
+    showMessage(error?.message || "无法启动抖音视频下载。", "error");
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -813,12 +1064,20 @@ function updateFeature(feature) {
   });
   elements.imagesPanel.hidden = feature !== "images";
   elements.screenshotPanel.hidden = feature !== "screenshot";
+  elements.douyinPanel.hidden = feature !== "douyin";
   elements.bilibiliPanel.hidden = feature !== "bilibili";
   if (feature !== "images") closeImagePreview();
   showMessage("");
   if (!state.backgroundJobId) elements.progress.hidden = true;
   chrome.storage.local.set({ feature });
   if (
+    feature === "douyin" &&
+    state.tab?.id &&
+    !state.douyinVideo &&
+    !state.busy
+  ) {
+    scanDouyinVideo();
+  } else if (
     feature === "bilibili" &&
     state.tab?.id &&
     !state.biliParts.length &&
@@ -2499,6 +2758,15 @@ elements.captureOptions.forEach((option) => {
   option.addEventListener("click", () => updateMode(option.dataset.mode));
 });
 elements.scanButton.addEventListener("click", scanImages);
+elements.douyinScanButton.addEventListener("click", scanDouyinVideo);
+elements.douyinDownloadButton.addEventListener("click", startDouyinDownload);
+elements.douyinQuality.addEventListener("change", updateDouyinVideoMeta);
+elements.douyinCodec.addEventListener("change", updateDouyinQualityOptions);
+elements.douyinDownloadCover.addEventListener("change", () => {
+  chrome.storage.local
+    .set({ douyinDownloadCover: elements.douyinDownloadCover.checked })
+    .catch(() => {});
+});
 elements.biliScanButton.addEventListener("click", scanBilibiliVideos);
 [elements.biliQuality, elements.biliAudioQuality, elements.biliCodec, elements.biliAudio]
   .forEach((control) => {

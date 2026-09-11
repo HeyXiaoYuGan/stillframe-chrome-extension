@@ -22,26 +22,30 @@
             <option value="en">English</option>
           </select>
           <button id="openOptionsButton" type="button">设置</button>
-          <span class="version" id="versionLabel">V1.0.1</span>
+          <span class="version" id="versionLabel">V1.2.0</span>
         </div>
       </header>
 
       <nav class="feature-tabs" aria-label="功能选择">
-        <button class="feature-tab active" type="button" data-feature="images">
-          <span aria-hidden="true">▦</span>
-          提取图片与视频
-        </button>
-        <button class="feature-tab" type="button" data-feature="screenshot">
-          <span aria-hidden="true">◉</span>
-          网页截图
-        </button>
         <button class="feature-tab" type="button" data-feature="bilibili">
           <svg class="bilibili-tab-icon" aria-hidden="true" viewBox="0 0 24 24">
             <path d="m8 4 4 3 4-3"></path>
             <rect x="3" y="7" width="18" height="13" rx="4"></rect>
             <path d="m10 11 5 3-5 3z"></path>
           </svg>
-          B站视频
+          B站
+        </button>
+        <button class="feature-tab" type="button" data-feature="douyin">
+          <span class="douyin-tab-icon" aria-hidden="true">♪</span>
+          抖音
+        </button>
+        <button class="feature-tab active" type="button" data-feature="images">
+          <span aria-hidden="true">▦</span>
+          媒体
+        </button>
+        <button class="feature-tab" type="button" data-feature="screenshot">
+          <span aria-hidden="true">◉</span>
+          截图
         </button>
       </nav>
 
@@ -164,6 +168,52 @@
           <span id="buttonText">拍下可见区域</span>
           <b aria-hidden="true"><i></i></b>
         </button>
+      </section>
+
+      <section class="feature-panel douyin-panel" id="douyinPanel" hidden>
+        <div class="panel-intro compact">
+          <h2>抖音视频下载</h2>
+          <p>读取当前网页版抖音作品，并选择页面实际提供的清晰度与编码。</p>
+        </div>
+
+        <button class="primary-button douyin-scan" id="douyinScanButton" type="button">
+          <span id="douyinScanButtonText">识别当前抖音视频</span>
+          <b aria-hidden="true">→</b>
+        </button>
+
+        <div class="douyin-results" id="douyinResults" hidden>
+          <article class="douyin-card">
+            <img id="douyinCover" alt="抖音视频封面" />
+            <div>
+              <strong id="douyinVideoTitle">当前抖音视频</strong>
+              <small id="douyinVideoAuthor">作者未知</small>
+              <span id="douyinVideoMeta">等待读取视频信息</span>
+            </div>
+          </article>
+          <div class="douyin-settings-grid">
+            <label class="douyin-quality">下载画质
+              <select id="douyinQuality"></select>
+            </label>
+            <label class="douyin-quality" id="douyinCodecField" hidden>编码
+              <select id="douyinCodec"></select>
+            </label>
+          </div>
+          <div class="douyin-extras">
+            <label id="douyinCoverOption" hidden>
+              <input id="douyinDownloadCover" type="checkbox">封面
+            </label>
+          </div>
+          <button class="douyin-download" id="douyinDownloadButton" type="button">
+            下载当前抖音视频
+          </button>
+          <small class="douyin-note">下载地址来自当前页面，临时地址失效时请刷新抖音页面后重新识别。</small>
+        </div>
+
+        <div class="empty-hint douyin-empty" id="douyinEmptyHint">
+          <span class="scan-frame" aria-hidden="true"><i></i></span>
+          <strong>等待识别抖音视频</strong>
+          <p>支持 douyin.com 的视频作品页面</p>
+        </div>
       </section>
 
       <section class="feature-panel bilibili-panel" id="bilibiliPanel" hidden>
