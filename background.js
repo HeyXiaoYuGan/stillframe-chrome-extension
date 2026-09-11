@@ -12,7 +12,6 @@ const jobStatusTabIds = new Set();
 const forcedFilenameByUrl = new Map();
 let activeJobCache;
 const BILIBILI_HEADER_RULE_ID = 9767001;
-const DOUYIN_HEADER_RULE_ID = 9767003;
 let liveScanEnabled = false;
 let liveScanSettingLoaded = false;
 
@@ -29,52 +28,33 @@ loadLiveScanSetting().catch(() => {
   liveScanSettingLoaded = true;
 });
 
-async function ensureSiteDownloadHeaders() {
+async function ensureBilibiliDownloadHeaders() {
   if (!chrome.declarativeNetRequest?.updateDynamicRules) return;
   await chrome.declarativeNetRequest.updateDynamicRules({
     // 9767002 removes a legacy dynamic rule created by an earlier release.
-    removeRuleIds: [BILIBILI_HEADER_RULE_ID, DOUYIN_HEADER_RULE_ID, 9767002],
-    addRules: [
-      {
-        id: BILIBILI_HEADER_RULE_ID,
-        priority: 1,
-        action: {
-          type: "modifyHeaders",
-          requestHeaders: [{
-            header: "Referer",
-            operation: "set",
-            value: "https://www.bilibili.com/",
-          }],
-        },
-        condition: {
-          regexFilter: "^https?://[^/]+\\.bilivideo\\.(com|cn)/",
-          resourceTypes: ["media", "other", "xmlhttprequest"],
-        },
+    removeRuleIds: [BILIBILI_HEADER_RULE_ID, 9767002],
+    addRules: [{
+      id: BILIBILI_HEADER_RULE_ID,
+      priority: 1,
+      action: {
+        type: "modifyHeaders",
+        requestHeaders: [{
+          header: "Referer",
+          operation: "set",
+          value: "https://www.bilibili.com/",
+        }],
       },
-      {
-        id: DOUYIN_HEADER_RULE_ID,
-        priority: 1,
-        action: {
-          type: "modifyHeaders",
-          requestHeaders: [{
-            header: "Referer",
-            operation: "set",
-            value: "https://www.douyin.com/",
-          }],
-        },
-        condition: {
-          regexFilter:
-            "^https?://([^/]+\\.)?(douyinvod\\.com|douyinstatic\\.com|douyinpic\\.com|bytecdn\\.(cn|com)|byteimg\\.com|bytedance\\.com|bytevcloud\\.com|ibytedtos\\.com|pstatp\\.com|zjcdn\\.com|byted\\.org)/",
-          resourceTypes: ["media", "other", "xmlhttprequest"],
-        },
+      condition: {
+        regexFilter: "^https?://[^/]+\\.bilivideo\\.(com|cn)/",
+        resourceTypes: ["media", "other", "xmlhttprequest"],
       },
-    ],
+    }],
   });
 }
 
-ensureSiteDownloadHeaders().catch(() => {});
+ensureBilibiliDownloadHeaders().catch(() => {});
 chrome.runtime.onInstalled.addListener((details) => {
-  ensureSiteDownloadHeaders().catch(() => {});
+  ensureBilibiliDownloadHeaders().catch(() => {});
   chrome.storage.local.set({ authorSignature: "DINGGE" }).catch(() => {});
   chrome.storage.local.remove("downloadDirectory").catch(() => {});
   if (
@@ -737,7 +717,7 @@ function isLikelyWebpUrl(rawUrl) {
   }
 }
 
-async function downloadWebpAsPng(url, filename, category = "媒体") {
+async function downloadWebpAsPng(url, filename) {
   await ensureOffscreenDocument();
   const response = await chrome.runtime.sendMessage({
     type: "DINGGE_CONVERT_WEBP_TO_PNG",
@@ -753,22 +733,22 @@ async function downloadWebpAsPng(url, filename, category = "媒体") {
   ) + ".png";
   return chrome.downloads.download({
     url: response.objectUrl,
-    filename: await downloadPath(category, pngFilename),
+    filename: await downloadPath("媒体", pngFilename),
     saveAs: false,
   });
 }
 
-async function downloadImageWithPreferredFormat(url, filename, category = "媒体") {
+async function downloadImageWithPreferredFormat(url, filename) {
   if (isLikelyWebpUrl(url)) {
     try {
-      return await downloadWebpAsPng(url, filename, category);
+      return await downloadWebpAsPng(url, filename);
     } catch {
       // Fall back to the source WebP if decoding is unavailable.
     }
   }
   return chrome.downloads.download({
     url,
-    filename: await downloadPath(category, filename),
+    filename: await downloadPath("媒体", filename),
     saveAs: false,
   });
 }
@@ -1205,239 +1185,6 @@ function isPinterestHostname(hostname) {
   );
 }
 
-function isDouyinHostname(hostname) {
-  const normalized = String(hostname || "").toLowerCase();
-  return normalized === "douyin.com" || normalized.endsWith(".douyin.com");
-}
-
-async function readDouyinContentVideoFromTab(tab) {
-  if (!tab?.id || !isDouyinHostname(new URL(tab.url || "").hostname)) {
-    throw new Error("当前标签页不是抖音网页。");
-  }
-  let response;
-  try {
-    response = await chrome.tabs.sendMessage(tab.id, {
-      type: "DINGGE_GET_DOUYIN_VIDEO",
-    });
-  } catch (error) {
-    if (!/receiving end does not exist|could not establish connection/i.test(
-      String(error?.message || error || ""),
-    )) {
-      throw error;
-    }
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      files: ["i18n.js", "content.js"],
-    });
-    response = await chrome.tabs.sendMessage(tab.id, {
-      type: "DINGGE_GET_DOUYIN_VIDEO",
-    });
-  }
-  return response?.ok && response.video?.candidates?.length
-    ? response.video
-    : null;
-}
-
-async function readDouyinMainWorldVideo(tabId) {
-  if (!tabId) return null;
-  try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
-      files: ["douyin-main.js"],
-    });
-    return results?.[0]?.result?.candidates?.length ? results[0].result : null;
-  } catch {
-    return null;
-  }
-}
-
-function mergeDouyinVideos(...rawVideos) {
-  const videos = rawVideos.filter(
-    (video) => video && Array.isArray(video.candidates) && video.candidates.length,
-  );
-  if (!videos.length) return null;
-  const selectableGroups = new Map();
-  const genericUrls = new Map();
-  videos.forEach((video) => {
-    video.candidates.forEach((candidate) => {
-      const urls = [candidate?.url, ...(candidate?.fallbackUrls || [])]
-        .map((url) => String(url || ""))
-        .filter((url) => /^https?:\/\//i.test(url));
-      if (!urls.length) return;
-      if (candidate.selectable === true) {
-        const key =
-          candidate.qualityKey ||
-          [
-            Number(candidate.width) || 0,
-            Number(candidate.height) || 0,
-            Number(candidate.bitRate) || 0,
-            Number(candidate.fps) || 0,
-            candidate.codec || "",
-            candidate.hdr ? "hdr" : "sdr",
-          ].join(":");
-        const existing = selectableGroups.get(key);
-        if (existing) {
-          const mergedUrls = [
-            existing.url,
-            ...existing.fallbackUrls,
-            ...urls,
-          ].filter((url, index, values) => values.indexOf(url) === index);
-          existing.url = mergedUrls[0];
-          existing.fallbackUrls = mergedUrls.slice(1);
-          return;
-        }
-        selectableGroups.set(key, {
-          ...candidate,
-          qualityKey: key,
-          url: urls[0],
-          fallbackUrls: urls.slice(1),
-        });
-        return;
-      }
-      urls.forEach((url) => {
-        if (!genericUrls.has(url)) {
-          genericUrls.set(url, {
-            ...candidate,
-            url,
-            fallbackUrls: [],
-            selectable: false,
-          });
-        }
-      });
-    });
-  });
-  const selectable = [...selectableGroups.values()].sort(
-    (left, right) =>
-      Number(right.width || 0) * Number(right.height || 0) -
-        Number(left.width || 0) * Number(left.height || 0) ||
-      Number(right.bitRate || 0) - Number(left.bitRate || 0) ||
-      Number(right.fps || 0) - Number(left.fps || 0),
-  );
-  const selectedUrls = new Set(
-    selectable.flatMap((candidate) => [candidate.url, ...candidate.fallbackUrls]),
-  );
-  const generic = [...genericUrls.values()].filter(
-    (candidate) => !selectedUrls.has(candidate.url),
-  );
-  const candidates = [...selectable, ...generic].slice(0, 30);
-  if (!candidates.length) return null;
-  const metadata = (key, fallback = "") =>
-    videos.find((video) => video[key])?.[key] || fallback;
-  return {
-    awemeId: String(metadata("awemeId", "")),
-    title: String(metadata("title", "抖音视频")),
-    author: String(metadata("author", "")),
-    cover: String(metadata("cover", "")),
-    width: Number(metadata("width", candidates[0]?.width || 0)) || 0,
-    height: Number(metadata("height", candidates[0]?.height || 0)) || 0,
-    duration: Number(metadata("duration", 0)) || 0,
-    candidates,
-  };
-}
-
-async function readDouyinVideoFromTab(tab) {
-  if (!tab?.id || !isDouyinHostname(new URL(tab.url || "").hostname)) {
-    throw new Error("当前标签页不是抖音网页。");
-  }
-  const [mainResult, contentResult] = await Promise.allSettled([
-    readDouyinMainWorldVideo(tab.id),
-    readDouyinContentVideoFromTab(tab),
-  ]);
-  const video = mergeDouyinVideos(
-    mainResult.status === "fulfilled" ? mainResult.value : null,
-    contentResult.status === "fulfilled" ? contentResult.value : null,
-  );
-  if (!video?.candidates?.length) {
-    const contentError =
-      contentResult.status === "rejected" ? contentResult.reason?.message : "";
-    throw new Error(
-      contentError || "没有读取到可下载的视频地址，请先播放视频几秒后重试。",
-    );
-  }
-  return video;
-}
-
-async function downloadDouyinVideo(
-  tab,
-  rawVideo,
-  preferredIndex = 0,
-  downloadCover = false,
-) {
-  if (!tab?.id || !isDouyinHostname(new URL(tab.url || "").hostname)) {
-    throw new Error("当前标签页不是抖音网页。");
-  }
-  const video = rawVideo?.candidates?.length
-    ? rawVideo
-    : await readDouyinVideoFromTab(tab);
-  const candidateGroups = (Array.isArray(video.candidates) ? video.candidates : [])
-    .slice(0, 30);
-  if (!candidateGroups.length) {
-    throw new Error("当前抖音作品没有可下载的视频地址。");
-  }
-  const selectedIndex = Math.max(
-    0,
-    Math.min(candidateGroups.length - 1, Number(preferredIndex) || 0),
-  );
-  const selectedGroup = candidateGroups[selectedIndex];
-  const selectedQualityUrls = [
-    selectedGroup?.url,
-    ...(Array.isArray(selectedGroup?.fallbackUrls)
-      ? selectedGroup.fallbackUrls
-      : []),
-  ];
-  const genericFallbackUrls = selectedGroup?.selectable
-    ? []
-    : candidateGroups
-        .filter((_candidate, index) => index !== selectedIndex)
-        .flatMap((candidate) => [candidate?.url, ...(candidate?.fallbackUrls || [])]);
-  const orderedCandidates = [...new Set([...selectedQualityUrls, ...genericFallbackUrls])]
-    .map((url) => String(url || ""))
-    .filter((url) => /^https?:\/\//i.test(url));
-  if (!orderedCandidates.length) {
-    throw new Error("所选抖音画质没有可下载的视频地址。");
-  }
-  const workingUrl =
-    (await findFirstWorkingVideoUrl(orderedCandidates)) || orderedCandidates[0];
-  const title = sanitizeFilename(video.title || "抖音视频");
-  const author = sanitizeFilename(video.author || "");
-  const awemeId = sanitizeFilename(video.awemeId || "");
-  const basename =
-    [title, author && `@${author}`, awemeId]
-      .filter(Boolean)
-      .join("-")
-      .slice(0, 76)
-      .replace(/[ .-]+$/g, "") || "抖音视频";
-  const downloadId = await downloadWithForcedFilename({
-    url: workingUrl,
-    filename: await downloadPath("抖音", `${basename}.mp4`),
-    saveAs: false,
-  });
-  if (downloadId === undefined) {
-    throw new Error("Chrome 没有创建抖音视频下载任务。");
-  }
-  let coverDownloadId;
-  if (downloadCover && /^https?:\/\//i.test(String(video.cover || ""))) {
-    try {
-      coverDownloadId = await downloadImageWithPreferredFormat(
-        video.cover,
-        `${basename}-封面.jpg`,
-        "抖音",
-      );
-    } catch {
-      // A failed optional cover must not cancel an already-started video download.
-    }
-  }
-  await notify("定格：抖音视频下载已开始", `正在保存“${title}”。`);
-  return {
-    downloadId,
-    coverRequested:
-      downloadCover && /^https?:\/\//i.test(String(video.cover || "")),
-    coverDownloaded: coverDownloadId !== undefined,
-    filename: `${basename}.mp4`,
-  };
-}
-
 async function readPinterestRequestToken(tab) {
   try {
     if (!tab?.id || !isPinterestHostname(new URL(tab.url || "").hostname)) {
@@ -1761,74 +1508,7 @@ function replaceMediaExtension(filename, suffix) {
   return `${base}.${suffix}.m4s`;
 }
 
-function unwrapBilibiliJson(payload) {
-  if (!payload || typeof payload !== "object") {
-    throw new Error("B站接口返回了无效数据。");
-  }
-  if (Number(payload.code) !== 0) {
-    const code = Number(payload.code);
-    const detail = String(payload.message || payload.msg || "B站接口返回错误");
-    throw new Error(`${detail}${Number.isFinite(code) ? `（${code}）` : ""}`);
-  }
-  return payload.data ?? payload.result;
-}
-
-async function bilibiliJsonFromTab(path, tabId) {
-  if (!tabId || !chrome.scripting?.executeScript) {
-    throw new Error("当前 B站标签页不可用。");
-  }
-  const results = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: "MAIN",
-    func: async (apiPath) => {
-      const origins = ["https://api.bilibili.com"];
-      if (/(^|\.)bilibili\.com$/i.test(location.hostname)) {
-        origins.push(location.origin);
-      }
-      let lastError = "";
-      for (const origin of [...new Set(origins)]) {
-        try {
-          const response = await fetch(new URL(apiPath, origin).href, {
-            credentials: "include",
-            cache: "no-store",
-            headers: { Accept: "application/json, text/plain, */*" },
-          });
-          if (!response.ok) {
-            throw new Error(`B站接口请求失败（${response.status}）`);
-          }
-          const payload = await response.json();
-          if (Number(payload?.code) !== 0) {
-            const code = Number(payload?.code);
-            const detail = String(payload?.message || payload?.msg || "B站接口返回错误");
-            throw new Error(
-              `${detail}${Number.isFinite(code) ? `（${code}）` : ""}`,
-            );
-          }
-          return { ok: true, payload };
-        } catch (error) {
-          lastError = error?.message || String(error || "");
-        }
-      }
-      return { ok: false, error: lastError || "B站页面接口暂时不可用。" };
-    },
-    args: [path],
-  });
-  const result = results?.[0]?.result;
-  if (!result?.ok) {
-    throw new Error(result?.error || "B站页面接口暂时不可用。");
-  }
-  return unwrapBilibiliJson(result.payload);
-}
-
-async function bilibiliJson(path, tabId = 0) {
-  let pageError;
-  if (tabId) {
-    try {
-      return await bilibiliJsonFromTab(path, tabId);
-    } catch (error) {
-      pageError = error;
-    }
-  }
+async function bilibiliJson(path) {
   let lastError;
   for (const origin of [
     "https://api.bilibili.com",
@@ -1843,12 +1523,16 @@ async function bilibiliJson(path, tabId = 0) {
       if (!response.ok) {
         throw new Error(`B站接口请求失败（${response.status}）`);
       }
-      return unwrapBilibiliJson(await response.json());
+      const payload = await response.json();
+      if (payload.code !== 0) {
+        throw new Error(payload.message || `B站接口返回错误 ${payload.code}`);
+      }
+      return payload.data ?? payload.result;
     } catch (error) {
       lastError = error;
     }
   }
-  throw pageError || lastError || new Error("B站接口暂时不可用。");
+  throw lastError || new Error("B站接口暂时不可用。");
 }
 
 async function readBilibiliPageIdentity(tabId) {
@@ -1957,31 +1641,11 @@ async function readBilibiliPageIdentity(tabId) {
             .filter((url) => /\.m3u8(?:$|[?#])/i.test(url))
             .forEach((url) => hlsUrls.add(url));
         }
-        const pathEpId = Number(
-          location.pathname.match(/\/bangumi\/play\/ep(\d+)/i)?.[1] || 0,
-        );
-        const pathSeasonId = Number(
-          location.pathname.match(/\/bangumi\/play\/ss(\d+)/i)?.[1] || 0,
-        );
-        const epInfo = state.epInfo || {};
         return {
           bvid: String(first(["bvid", "bVid"]) || ""),
           aid: Number(first(["aid", "avid"]) || 0),
           cid: Number(first(["cid"]) || 0),
-          epId: Number(
-            epInfo.ep_id || epInfo.epId || epInfo.id || first(["ep_id", "epId"]) || pathEpId || 0,
-          ),
-          seasonId: Number(
-            epInfo.season_id ||
-              epInfo.seasonId ||
-              state.mediaInfo?.season_id ||
-              state.mediaInfo?.seasonId ||
-              first(["season_id", "seasonId"]) ||
-              pathSeasonId ||
-              0,
-          ),
-          session: String(playInfo.data?.session || playInfo.result?.session || ""),
-          isPgc: Boolean(pathEpId || pathSeasonId || state.epInfo),
+          epId: Number(first(["ep_id", "epId", "id"]) || 0),
           title: String(first(["title", "h1Title"]) || document.title || ""),
           currentVideoTitle,
           pageUrl: location.href,
@@ -2005,107 +1669,27 @@ async function readBilibiliPageIdentity(tabId) {
   }
 }
 
-function normalizeBilibiliPgcEpisodes(season = {}) {
-  const seasonId = Number(season?.season_id || season?.seasonId || 0);
-  const rawEpisodes = [
-    ...(Array.isArray(season?.episodes) ? season.episodes : []),
-    ...((Array.isArray(season?.section) ? season.section : []).flatMap(
-      (section) => (Array.isArray(section?.episodes) ? section.episodes : []),
-    )),
-  ];
-  const unique = new Map();
-  rawEpisodes.forEach((episode, index) => {
-    const cid = Number(episode?.cid || episode?.page?.cid || 0);
-    const epId = Number(episode?.ep_id || episode?.epId || episode?.id || 0);
-    if (!cid || (!epId && unique.has(`cid:${cid}`))) return;
-    const key = epId ? `ep:${epId}` : `cid:${cid}`;
-    if (unique.has(key)) return;
-    const rawDuration = Math.max(0, Number(episode?.duration || 0));
-    const titleParts = [episode?.title, episode?.long_title]
-      .map((value) => String(value || "").trim())
-      .filter(Boolean);
-    unique.set(key, {
-      page: unique.size + 1,
-      cid,
-      aid: Number(episode?.aid || episode?.avid || 0),
-      bvid: String(episode?.bvid || ""),
-      epId,
-      seasonId: Number(episode?.season_id || seasonId || 0),
-      title: String(episode?.title || "").trim(),
-      longTitle: String(episode?.long_title || "").trim(),
-      part: titleParts.join(" ") || `第 ${index + 1} 集`,
-      duration: rawDuration > 36_000 ? rawDuration / 1000 : rawDuration,
-      cover: String(episode?.cover || ""),
-    });
-  });
-  return [...unique.values()];
-}
-
 async function readBilibiliPartList(pageUrl, tabId = 0) {
   const pageIdentity = tabId ? await readBilibiliPageIdentity(tabId) : {};
   const parsedPage = new URL(pageUrl);
-  const pathEpId = Number(
-    parsedPage.pathname.match(/\/bangumi\/play\/ep(\d+)/i)?.[1] || 0,
-  );
-  const pathSeasonId = Number(
-    parsedPage.pathname.match(/\/bangumi\/play\/ss(\d+)/i)?.[1] || 0,
-  );
-  const epId = pathEpId || Number(pageIdentity.epId || 0);
-  const seasonId = pathSeasonId || Number(pageIdentity.seasonId || 0);
-  const isPgc = Boolean(
-    epId || seasonId || pageIdentity.isPgc || /\/bangumi\/play\//i.test(parsedPage.pathname),
-  );
-  let pgcSeason = null;
-  if (isPgc && (epId || seasonId)) {
-    pgcSeason = await bilibiliJson(
-      epId
-        ? `/pgc/view/web/season?ep_id=${epId}`
-        : `/pgc/view/web/season?season_id=${seasonId}`,
-      tabId,
-    ).catch(() => null);
-  }
-  const pgcEpisodes = normalizeBilibiliPgcEpisodes(pgcSeason || {});
-  const currentPgcEpisode =
-    pgcEpisodes.find((episode) => Number(episode.epId) === epId) ||
-    pgcEpisodes.find((episode) => Number(episode.cid) === Number(pageIdentity.cid)) ||
-    pgcEpisodes.find(
-      (episode) =>
-        episode.bvid &&
-        String(episode.bvid).toLowerCase() === String(pageIdentity.bvid || "").toLowerCase(),
-    ) ||
-    pgcEpisodes[0] ||
-    null;
   const bvid =
     parsedPage.pathname.match(/\/video\/(BV[a-zA-Z0-9]+)/i)?.[1] ||
-    String(currentPgcEpisode?.bvid || pageIdentity.bvid || "");
+    String(pageIdentity.bvid || "");
   const aid =
     Number(parsedPage.pathname.match(/\/video\/av(\d+)/i)?.[1] || 0) ||
-    Number(currentPgcEpisode?.aid || pageIdentity.aid || 0);
-  if (!bvid && !aid && !pgcEpisodes.length) {
-    return {
-      bvid: "",
-      aid: 0,
-      epId,
-      seasonId,
-      isPgc,
-      title: "",
-      parts: [],
-    };
+    Number(pageIdentity.aid || 0);
+  if (!bvid && !aid) {
+    return { bvid: "", aid: 0, title: "", parts: [] };
   }
   const identityQuery = bvid
     ? `bvid=${encodeURIComponent(bvid)}`
     : `aid=${aid}`;
-  const [pageListResult, viewResult] = bvid || aid
-    ? await Promise.allSettled([
-        bilibiliJson(`/x/player/pagelist?${identityQuery}`, tabId),
-        bilibiliJson(`/x/web-interface/view?${identityQuery}`, tabId),
-      ])
-    : [
-        { status: "fulfilled", value: [] },
-        { status: "fulfilled", value: null },
-      ];
+  const [pageListResult, viewResult] = await Promise.allSettled([
+    bilibiliJson(`/x/player/pagelist?${identityQuery}`),
+    bilibiliJson(`/x/web-interface/view?${identityQuery}`),
+  ]);
   const view = viewResult.status === "fulfilled" ? viewResult.value : null;
-  const ugcSeasonEpisodes = (
+  const seasonEpisodes = (
     Array.isArray(view?.ugc_season?.sections)
       ? view.ugc_season.sections
       : []
@@ -2145,14 +1729,13 @@ async function readBilibiliPartList(pageUrl, tabId = 0) {
   const playerEpisodes = Array.isArray(pageIdentity.playerEpisodes)
     ? pageIdentity.playerEpisodes
     : [];
-  const collectionEpisodes = pgcEpisodes.length
-    ? pgcEpisodes
-    : ugcSeasonEpisodes.length > 1
-      ? ugcSeasonEpisodes
+  const collectionEpisodes =
+    seasonEpisodes.length > 1
+      ? seasonEpisodes
       : playerEpisodes.length > 1
         ? playerEpisodes
         : [];
-  const pageCandidates = collectionEpisodes.length
+  const pageCandidates = collectionEpisodes.length > 1
     ? collectionEpisodes
     : multipartPages;
   const uniquePages = new Map();
@@ -2161,42 +1744,29 @@ async function readBilibiliPartList(pageUrl, tabId = 0) {
     if (!cid || uniquePages.has(cid)) return;
     uniquePages.set(cid, {
       page:
-        collectionEpisodes.length
+        collectionEpisodes.length > 1
           ? uniquePages.size + 1
           : Number(part.page) || uniquePages.size + 1 || index + 1,
       cid,
       aid: Number(part.aid || part.arc?.aid || 0),
       bvid: String(part.bvid || part.arc?.bvid || ""),
-      epId: Number(part.epId || part.ep_id || part.id || 0),
-      seasonId: Number(part.seasonId || part.season_id || seasonId || 0),
       title: String(part.part || part.title || `P${index + 1}`).trim(),
       duration: Math.max(0, Number(part.duration) || 0),
     });
   });
-  const fallbackCid = Number(
-    currentPgcEpisode?.cid || pageIdentity.cid || view?.cid || 0,
-  );
+  const fallbackCid = Number(pageIdentity.cid || view?.cid || 0);
   if (!uniquePages.size && fallbackCid > 0) {
     uniquePages.set(fallbackCid, {
       page: Math.max(1, Number(parsedPage.searchParams.get("p")) || 1),
       cid: fallbackCid,
-      aid,
-      bvid,
-      epId,
-      seasonId,
       title: String(
-        currentPgcEpisode?.part ||
-          pageIdentity.currentVideoTitle ||
-          pageIdentity.title ||
-          "主视频",
+        pageIdentity.currentVideoTitle || pageIdentity.title || "主视频",
       ).trim(),
-      duration: Math.max(0, Number(currentPgcEpisode?.duration || 0)),
+      duration: 0,
     });
   }
   const title = String(
-    pgcSeason?.title ||
-      pgcSeason?.media_info?.title ||
-      view?.ugc_season?.title ||
+    view?.ugc_season?.title ||
       view?.title ||
       pageIdentity.currentVideoTitle ||
       pageIdentity.title ||
@@ -2206,12 +1776,8 @@ async function readBilibiliPartList(pageUrl, tabId = 0) {
     (left, right) => left.page - right.page,
   );
   return {
-    bvid: String(currentPgcEpisode?.bvid || view?.bvid || bvid || ""),
-    aid: Number(currentPgcEpisode?.aid || view?.aid || aid || 0),
-    epId: Number(currentPgcEpisode?.epId || epId || 0),
-    seasonId: Number(currentPgcEpisode?.seasonId || seasonId || 0),
-    session: String(pageIdentity.session || ""),
-    isPgc,
+    bvid: String(view?.bvid || bvid || ""),
+    aid: Number(view?.aid || aid || 0),
     title,
     kind:
       collectionEpisodes.length > 1
@@ -2268,20 +1834,15 @@ async function readBilibiliPartSizes(
     const results = await Promise.all(
       batch.map(async (part) => {
         try {
+          const identityQuery = part.bvid
+            ? `bvid=${encodeURIComponent(part.bvid)}`
+            : part.aid
+              ? `aid=${part.aid}`
+              : partList.bvid
+                ? `bvid=${encodeURIComponent(partList.bvid)}`
+                : `aid=${partList.aid}`;
           const play = await bilibiliJson(
-            buildBilibiliPlayPath(
-              {
-                isPgc: Boolean(part.epId || partList.isPgc),
-                bvid: part.bvid || partList.bvid,
-                aid: part.aid || partList.aid,
-                cid: part.cid,
-                epId: part.epId || partList.epId,
-                seasonId: part.seasonId || partList.seasonId,
-                session: partList.session,
-              },
-              qn,
-            ),
-            tabId,
+            `/x/player/playurl?${identityQuery}&cid=${part.cid}&qn=${qn}&fnver=0&fnval=4048&fourk=1`,
           );
           const progressive = biliProgressiveStreams(play);
           if (progressive.length) {
@@ -2370,7 +1931,6 @@ async function collectBilibiliPartAttachments(resolved) {
     try {
       const player = await bilibiliJson(
         `/x/player/v2?bvid=${encodeURIComponent(resolved.bvid)}&cid=${resolved.cid}`,
-        resolved.tabId,
       );
       const tracks = player?.subtitle?.subtitles || [];
       for (const [trackIndex, track] of tracks.entries()) {
@@ -2451,36 +2011,6 @@ function biliCodecMatches(stream, codec) {
 }
 
 const BILI_QUALITY_ORDER = [127, 126, 125, 120, 116, 112, 80, 74, 64, 32, 16, 6];
-
-function buildBilibiliPlayPath(identity = {}, requestedQuality = 80, variant = "") {
-  const params = new URLSearchParams(variant);
-  const isPgc = identity.isPgc === true;
-  const bvid = String(identity.bvid || "");
-  const aid = Number(identity.aid || 0);
-  const cid = Number(identity.cid || 0);
-  const epId = Number(identity.epId || 0);
-  const seasonId = Number(identity.seasonId || 0);
-  if (isPgc) {
-    if (aid) params.set("avid", String(aid));
-    else if (bvid) params.set("bvid", bvid);
-    if (epId) params.set("ep_id", String(epId));
-    if (seasonId) params.set("season_id", String(seasonId));
-    if (identity.session) params.set("session", String(identity.session));
-    params.set("module", "bangumi");
-    params.set("from_client", "BROWSER");
-    params.set("otype", "json");
-  } else if (bvid) {
-    params.set("bvid", bvid);
-  } else if (aid) {
-    params.set("aid", String(aid));
-  }
-  if (cid) params.set("cid", String(cid));
-  params.set("qn", String(Number(requestedQuality) || 80));
-  if (!params.has("fnver")) params.set("fnver", "0");
-  if (!params.has("fnval")) params.set("fnval", "4048");
-  if (!params.has("fourk")) params.set("fourk", "1");
-  return `${isPgc ? "/pgc/player/web/playurl" : "/x/player/playurl"}?${params}`;
-}
 
 function biliQualityPosition(value) {
   const quality = Number(value);
@@ -2617,14 +2147,8 @@ async function startMediaDownloadWithFallback(urls, filename, label = "媒体") 
   );
 }
 
-async function resolveBilibiliDownload(
-  pageUrl,
-  pageIdentity = {},
-  preferHls = false,
-  tabId = 0,
-) {
+async function resolveBilibiliDownload(pageUrl, pageIdentity = {}, preferHls = false) {
   const parsedPage = new URL(pageUrl);
-  const resolvedTabId = Number(tabId || pageIdentity.tabId || 0);
   let bvid =
     String(pageIdentity.bvid || "") ||
     parsedPage.pathname.match(/\/video\/(BV[a-zA-Z0-9]+)/i)?.[1] ||
@@ -2634,35 +2158,30 @@ async function resolveBilibiliDownload(
     Number(parsedPage.pathname.match(/\/video\/av(\d+)/i)?.[1] || 0);
   let cid = Number(pageIdentity.cid || 0);
   const epId =
-    Number(pageIdentity.epId || 0) ||
-    Number(parsedPage.pathname.match(/\/bangumi\/play\/ep(\d+)/i)?.[1] || 0);
-  const seasonId =
-    Number(pageIdentity.seasonId || 0) ||
-    Number(parsedPage.pathname.match(/\/bangumi\/play\/ss(\d+)/i)?.[1] || 0);
-  const isPgc = Boolean(
-    pageIdentity.isPgc || epId || seasonId || /\/bangumi\/play\//i.test(parsedPage.pathname),
+    Number(parsedPage.pathname.match(/\/bangumi\/play\/ep(\d+)/i)?.[1] || 0) ||
+    Number(pageIdentity.epId || 0);
+  const seasonId = Number(
+    parsedPage.pathname.match(/\/bangumi\/play\/ss(\d+)/i)?.[1] || 0,
   );
+  const isPgc = Boolean(epId || seasonId || /\/bangumi\/play\//i.test(parsedPage.pathname));
   let pgcEpisode = null;
   let pgcSeason = null;
-  if (isPgc && (epId || seasonId)) {
+  if (!bvid && !aid && (epId || seasonId)) {
     pgcSeason = await bilibiliJson(
       epId
         ? `/pgc/view/web/season?ep_id=${epId}`
         : `/pgc/view/web/season?season_id=${seasonId}`,
-      resolvedTabId,
-    ).catch(() => null);
-    const episodes = normalizeBilibiliPgcEpisodes(pgcSeason);
+    );
+    const episodes = [
+      ...(pgcSeason?.episodes || []),
+      ...((pgcSeason?.section || []).flatMap((section) => section.episodes || [])),
+    ];
     pgcEpisode =
-      episodes.find((episode) => Number(episode.epId) === epId) ||
+      episodes.find((episode) => Number(episode.id) === epId) ||
       episodes.find((episode) => Number(episode.cid) === cid) ||
-      episodes.find(
-        (episode) =>
-          episode.bvid &&
-          String(episode.bvid).toLowerCase() === String(bvid).toLowerCase(),
-      ) ||
       episodes[0];
-    bvid = String(pgcEpisode?.bvid || bvid || "");
-    aid = Number(pgcEpisode?.aid || aid || 0);
+    bvid = String(pgcEpisode?.bvid || "");
+    aid = Number(pgcEpisode?.aid || 0);
     cid = Number(pgcEpisode?.cid || cid || 0);
   }
   if (!bvid && !aid) {
@@ -2672,11 +2191,9 @@ async function resolveBilibiliDownload(
   const identityQuery = bvid
     ? `bvid=${encodeURIComponent(bvid)}`
     : `aid=${aid}`;
-  const [rawPages, view, preferences] = await Promise.all([
-    bilibiliJson(`/x/player/pagelist?${identityQuery}`, resolvedTabId).catch(() => []),
-    bilibiliJson(`/x/web-interface/view?${identityQuery}`, resolvedTabId).catch(
-      () => null,
-    ),
+  const [pages, view, preferences] = await Promise.all([
+    bilibiliJson(`/x/player/pagelist?${identityQuery}`),
+    bilibiliJson(`/x/web-interface/view?${identityQuery}`),
     chrome.storage.local.get({
       biliDownloadCover: false,
       biliDownloadAudio: true,
@@ -2689,13 +2206,11 @@ async function resolveBilibiliDownload(
       biliFilenameTemplate: "%title%",
     }),
   ]);
-  const pages = Array.isArray(rawPages) ? rawPages : [];
   const pageInfo =
     (cid && pages.find((page) => Number(page.cid) === cid)) ||
     pages[pageNumber - 1] ||
     pages[0] ||
-    pgcEpisode ||
-    (cid ? { cid, bvid, aid, part: pageIdentity.currentVideoTitle || "" } : null);
+    pgcEpisode;
   if (!pageInfo?.cid) throw new Error("无法取得当前分P的 CID。");
   cid = Number(pageInfo.cid);
   const resolvedPageIndex = pages.findIndex(
@@ -2703,18 +2218,8 @@ async function resolveBilibiliDownload(
   );
   if (resolvedPageIndex >= 0) pageNumber = resolvedPageIndex + 1;
   const qn = Number(preferences.biliQuality) || 80;
-  const playIdentity = {
-    isPgc,
-    bvid,
-    aid,
-    cid,
-    epId: Number(pgcEpisode?.epId || epId || 0),
-    seasonId: Number(pgcEpisode?.seasonId || seasonId || 0),
-    session: String(pageIdentity.session || ""),
-  };
   const play = await bilibiliJson(
-    buildBilibiliPlayPath(playIdentity, qn),
-    resolvedTabId,
+    `${isPgc ? "/pgc/player/web/playurl" : "/x/player/playurl"}?${identityQuery}&cid=${cid}&qn=${qn}&fnver=0&fnval=4048&fourk=1`,
   );
   const compatibilityPlays = [];
   if (preferHls || !biliProgressiveStreams(play).length) {
@@ -2727,8 +2232,7 @@ async function resolveBilibiliDownload(
       try {
         compatibilityPlays.push(
           await bilibiliJson(
-            buildBilibiliPlayPath(playIdentity, qn, query),
-            resolvedTabId,
+            `${isPgc ? "/pgc/player/web/playurl" : "/x/player/playurl"}?${identityQuery}&cid=${cid}&qn=${qn}&${query}`,
           ),
         );
       } catch {
@@ -2847,9 +2351,7 @@ async function resolveBilibiliDownload(
   const partTitle = String(pageInfo?.part || "").trim();
   const episodeTitle = [
     pgcEpisode?.title,
-    pgcEpisode?.longTitle,
     pgcEpisode?.long_title,
-    pgcEpisode?.part,
   ]
     .map((value) => String(value || "").trim())
     .filter(Boolean)
@@ -2894,10 +2396,6 @@ async function resolveBilibiliDownload(
     videoExtension: usingProgressive ? "mp4" : "video.m4s",
     audioIncluded: usingProgressive,
     coverUrl: pgcSeason?.cover || pgcEpisode?.cover || view?.pic || "",
-    epId: playIdentity.epId,
-    seasonId: playIdentity.seasonId,
-    isPgc,
-    tabId: resolvedTabId,
     preferences,
   };
 }
@@ -2953,7 +2451,6 @@ async function downloadBilibiliFromPage(
       preferredUrl,
       pageIdentity,
       Boolean(operationJobId),
-      tabId,
     );
     if (String(requestOptions.title || "").trim()) {
       resolved.title = String(requestOptions.title).trim();
@@ -3070,7 +2567,6 @@ async function downloadBilibiliFromPage(
   if (resolved.preferences.biliDownloadSrt || resolved.preferences.biliDownloadAss) {
     const player = await bilibiliJson(
       `/x/player/v2?bvid=${encodeURIComponent(resolved.bvid)}&cid=${resolved.cid}`,
-      resolved.tabId,
     );
     const tracks = player?.subtitle?.subtitles || [];
     for (const [trackIndex, track] of tracks.entries()) {
@@ -3208,14 +2704,9 @@ async function packageBilibiliParts(tab, jobId, requestOptions = {}) {
           bvid: part.bvid || partList.bvid,
           aid: part.aid || partList.aid,
           cid: part.cid,
-          epId: part.epId || partList.epId,
-          seasonId: part.seasonId || partList.seasonId,
-          session: partList.session,
-          isPgc: Boolean(part.epId || partList.isPgc),
           currentVideoTitle: part.title || partList.title,
         },
         false,
-        tab.id,
       );
       resolvedItems.push({
         name: `${resolved.baseName}.mp4`,
@@ -3428,16 +2919,6 @@ function createContextMenus() {
       ],
     });
     chrome.contextMenus.create({
-      id: "dingge-download-douyin-video",
-      parentId: "dingge-root",
-      title: t("下载抖音视频"),
-      contexts: ["page", "video", "link"],
-      documentUrlPatterns: [
-        "*://*.douyin.com/*",
-        "*://douyin.com/*",
-      ],
-    });
-    chrome.contextMenus.create({
       id: "dingge-download-bilibili-video",
       parentId: "dingge-root",
       title: t("下载 B站视频"),
@@ -3516,15 +2997,13 @@ function updateSiteVideoMenus(rawUrl) {
   }
   const isBilibili = /(^|\.)bilibili\.com$/i.test(hostname);
   const isPinterest = isPinterestHostname(hostname);
-  const isDouyin = isDouyinHostname(hostname);
   const excludesVideoDownload = isVideoDownloadExcludedPage(rawUrl);
   const updates = [
     ["dingge-download-bilibili-video", isBilibili],
     ["dingge-download-pinterest-video", isPinterest],
-    ["dingge-download-douyin-video", isDouyin],
     [
       "dingge-download-video",
-      !isBilibili && !isPinterest && !isDouyin && !excludesVideoDownload,
+      !isBilibili && !isPinterest && !excludesVideoDownload,
     ],
     ["dingge-pack-videos", !excludesVideoDownload],
   ];
@@ -3591,11 +3070,6 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
         }
         break;
       }
-      case "dingge-download-douyin-video": {
-        const video = await readDouyinVideoFromTab(tab);
-        await downloadDouyinVideo(tab, video, 0);
-        break;
-      }
       case "dingge-download-pinterest-video":
       case "dingge-download-video": {
         const jobId = crypto.randomUUID();
@@ -3642,43 +3116,6 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.target !== "background") return;
-
-  if (message.type === "DINGGE_GET_DOUYIN_VIDEO") {
-    (async () => {
-      const tabId = Number(sender.tab?.id || message.tabId || 0);
-      const tab = sender.tab || (tabId ? await chrome.tabs.get(tabId) : null);
-      if (!tab?.id) throw new Error("无法取得当前抖音标签页。");
-      const video = await readDouyinVideoFromTab(tab);
-      sendResponse({ ok: true, video });
-    })().catch((error) => {
-      sendResponse({
-        ok: false,
-        error: error?.message || "抖音视频识别失败。",
-      });
-    });
-    return true;
-  }
-
-  if (message.type === "DINGGE_START_DOUYIN_DOWNLOAD") {
-    (async () => {
-      const tabId = Number(sender.tab?.id || message.tabId || 0);
-      const tab = sender.tab || (tabId ? await chrome.tabs.get(tabId) : null);
-      if (!tab?.id) throw new Error("无法取得当前抖音标签页。");
-      const result = await downloadDouyinVideo(
-        tab,
-        message.video,
-        message.preferredIndex,
-        message.downloadCover === true,
-      );
-      sendResponse({ started: true, ...result });
-    })().catch((error) => {
-      sendResponse({
-        started: false,
-        error: error?.message || "无法启动抖音视频下载。",
-      });
-    });
-    return true;
-  }
 
   if (message.type === "DINGGE_GET_BILIBILI_PARTS") {
     (async () => {
@@ -3743,7 +3180,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           pageUrl,
           pageIdentity,
           false,
-          tabId,
         );
       } catch (error) {
         sendResponse({

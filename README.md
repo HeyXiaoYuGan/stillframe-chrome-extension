@@ -1,12 +1,8 @@
 # 定格 StillFrame
 
-**当前版本 / Current version: 1.2.0**
-
-[版本说明 / Release notes](RELEASE_NOTES.md)
-
 StillFrame 是一款面向 Chrome 及 Chromium 浏览器的网页媒体提取扩展，用于在浏览器本地发现、筛选、预览和保存网页中的图片与视频资源。
 
-它支持普通网页媒体扫描、图片画廊、批量下载、ZIP 打包、网页截图，并针对 Pinterest、网页版抖音和 B站提供专用处理能力。媒体解析、截图拼接、ZIP 生成以及 B站 DASH 音视频封装均在本地完成，不依赖维护者运营的服务器。
+它支持普通网页媒体扫描、图片画廊、批量下载、ZIP 打包、网页截图，并针对 Pinterest 和 B站提供专用处理能力。媒体解析、截图拼接、ZIP 生成以及 B站 DASH 音视频封装均在本地完成，不依赖维护者运营的服务器。
 
 ## 主要功能
 
@@ -55,22 +51,9 @@ StillFrame 是一款面向 Chrome 及 Chromium 浏览器的网页媒体提取扩
 - Pinterest 请求令牌仅在用户主动下载时临时使用
 - 令牌不会写入长期存储、日志或通知
 
-### 网页版抖音支持
-
-- 识别 `douyin.com` 当前视频作品
-- 从页面已加载的作品数据、视频元素和媒体请求中合并可用地址
-- 显示作品标题、作者、封面、时长和分辨率
-- 列出当前作品页面实际提供的全部清晰度，可任选一档下载 MP4
-- 页面明确提供编码信息时，可按 AVC、HEVC 或 AV1 筛选视频流
-- 可选同时下载当前作品封面
-- 抖音 MP4 已包含页面提供的声音；页面没有独立音轨列表时，不显示音质或独立音频选项
-- 支持扩展面板和右键菜单下载
-- 临时媒体地址只在当前页面与下载流程中使用，不发送到第三方解析服务
-
 ### B站支持
 
 - 识别当前页面主视频
-- 使用当前已登录的 B站账号会话读取该账号有权播放的普通视频与会员番剧
 - 支持传统分P、选集和合集列表
 - 分P视频可单独选择或批量打包
 - 大批量分P会使用浏览器磁盘空间流式打包，并按 4 GB 自动拆分为多个 ZIP
@@ -115,7 +98,7 @@ StillFrame 主要在用户浏览器本地处理数据。设置保存在 `chrome.
 
 StillFrame 自有源码采用 [MIT License](LICENSE)。Mediabunny 继续适用其独立的 Mozilla Public License 2.0 条款。
 
-> StillFrame 是一款本地运行的 Chrome 网页媒体提取工具，支持图片与视频扫描、高清去重、媒体画廊、ZIP 打包、网页截图，以及 Pinterest、网页版抖音和 B站专用下载功能。
+> StillFrame 是一款本地运行的 Chrome 网页媒体提取工具，支持图片与视频扫描、高清去重、媒体画廊、ZIP 打包、网页截图，以及 Pinterest 和 B站专用下载功能。
 
 ## Features
 StillFrame is a local-first media extraction extension for Chrome and Chromium-based browsers. It discovers, filters, previews, and saves images and videos from web pages without uploading media or browsing data to a maintainer-operated server.
@@ -136,11 +119,9 @@ StillFrame is a local-first media extraction extension for Chrome and Chromium-b
 - Converts WebP images to PNG when enabled.
 - Captures the visible area or a full page as PNG, JPG, or PDF, with optional 3-second or 5-second delays.
 
-### Pinterest, Douyin, and Bilibili support
+### Pinterest and Bilibili support
 
 - Prefers original Pinterest images and supports Pinterest short videos and HLS media.
-- Detects the current video on `douyin.com` from page data, video elements, and media requests, then lets the user choose an available quality and download it locally.
-- Uses the current signed-in Bilibili browser session for regular videos and member episodes that the account is authorized to play.
 - Detects Bilibili main videos, multipart videos, episode lists, and collections.
 - Supports selectable video quality, audio quality, and codec options based on the source response.
 - Packages selected Bilibili parts and can include audio, SRT/ASS subtitles, XML danmaku, and cover images.
