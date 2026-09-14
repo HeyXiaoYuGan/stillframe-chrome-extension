@@ -1,47 +1,23 @@
-# StillFrame v1.0.2 版本说明 / Release Notes
+# StillFrame 版本说明 / Release Notes
 
-## 中文
+## v1.0.3
 
-本版本将当前功能与修复统一归入 v1.0.2。
+### 中文
 
-### B站
+- 新增“神秘入口”，用于尝试识别当前页面已加载且可直接保存的视频。
+- “神秘入口”固定在品牌栏“定格”右侧，并随界面语言显示中文名或英文名。
+- 优化当前页面多视频识别、列表恢复、封面回退和主播放器筛选。
+- 完善图片与短视频扫描、筛选、画廊预览、批量下载和 ZIP 打包。
+- 支持可见区域、完整页面以及 PNG、JPG、PDF 网页截图。
+- 完善 Pinterest、抖音和 B站的专用保存流程与后台处理进度。
+- 媒体解析、截图拼接、ZIP 生成及视频处理继续在浏览器本地完成。
 
-- 修复已登录大会员账号仍无法解析番剧的问题。
-- 番剧播放请求使用当前 B站页面的登录会话，并携带对应的 `avid`、`cid`、`ep_id`、`season_id` 与临时播放 `session`。
-- 支持从番剧页面读取正片与附加剧集；页面未直接提供 BV/AV 时，可通过番剧信息恢复剧集列表。
-- 普通视频、分P、合集、字幕、弹幕、封面及 DASH 音视频本地封装能力保持不变。
-- 仅使用当前账号已经拥有的播放权限，不绕过登录、会员、购买、地区或 DRM 限制。
+### English
 
-### 抖音
-
-- 支持列出页面实际提供的全部清晰度。
-- 支持在页面明确提供编码信息时按 AVC、HEVC 或 AV1 筛选。
-- 改进主页面数据、内容脚本数据和备用媒体地址的合并。
-
-### 稳定性
-
-- 增加 B站会员番剧请求及抖音清晰度解析的回归测试。
-- 媒体解析、下载、ZIP 打包及 DASH 封装继续在浏览器本地完成。
-
-## English
-
-This release consolidates the current feature set and fixes under version 1.0.2.
-
-### Bilibili
-
-- Fixed episode resolution failing even when the signed-in account has an active Bilibili membership.
-- PGC playback requests now use the current Bilibili page session and include the matching `avid`, `cid`, `ep_id`, `season_id`, and temporary playback `session` values.
-- Added reliable episode-list recovery for PGC pages that do not directly expose a BV or AV identifier, including main and extra episodes.
-- Existing support for regular videos, multipart videos, collections, subtitles, danmaku, covers, and local DASH audio/video muxing remains available.
-- The extension only uses playback rights already granted to the current account. It does not bypass sign-in, membership, purchase, regional, or DRM restrictions.
-
-### Douyin
-
-- Lists every quality variant actually exposed by the current page.
-- Supports AVC, HEVC, and AV1 filtering when codec metadata is explicitly available.
-- Improves merging of main-world data, content-script data, and fallback media URLs.
-
-### Reliability
-
-- Added regression coverage for Bilibili member-episode requests and Douyin quality extraction.
-- Media parsing, downloads, ZIP packaging, and DASH muxing continue to run locally in the browser.
+- Added “Secret Entry” for detecting directly savable videos already loaded by the current page.
+- Fixed “Secret Entry” beside the StillFrame brand name and localized its label with the interface language.
+- Improved multi-video detection, list restoration, cover fallback, and main-player filtering for the current page.
+- Improved image and short-video scanning, filtering, gallery preview, batch downloads, and ZIP packaging.
+- Added visible-area and full-page capture with PNG, JPG, and PDF output.
+- Improved dedicated saving workflows and background progress for Pinterest, Douyin, and Bilibili.
+- Media parsing, screenshot stitching, ZIP generation, and video processing continue to run locally in the browser.

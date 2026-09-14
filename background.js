@@ -7,6 +7,10 @@ let creatingOffscreen;
 const networkMediaByTab = new Map();
 const contextMediaByTab = new Map();
 const bilibiliDashByTab = new Map();
+const secretCaptureUntilByTab = new Map();
+const secretVideosByTab = new Map();
+const secretVideosLoadingByTab = new Map();
+const secretVideoCacheQueuesByTab = new Map();
 const canceledJobIds = new Set();
 const jobStatusTabIds = new Set();
 const forcedFilenameByUrl = new Map();
@@ -167,6 +171,64 @@ function networkStorageKey(tabId) {
   return `networkMedia:${tabId}`;
 }
 
+function secretVideosStorageKey(tabId) {
+  return `secretVideos:${tabId}`;
+}
+
+function queueSecretVideoCacheOperation(tabId, operation) {
+  const previous = secretVideoCacheQueuesByTab.get(tabId) || Promise.resolve();
+  const queued = previous.catch(() => {}).then(operation);
+  secretVideoCacheQueuesByTab.set(tabId, queued);
+  return queued.finally(() => {
+    if (secretVideoCacheQueuesByTab.get(tabId) === queued) {
+      secretVideoCacheQueuesByTab.delete(tabId);
+    }
+  });
+}
+
+async function getCachedSecretVideos(tabId) {
+  if (secretVideosByTab.has(tabId)) return secretVideosByTab.get(tabId);
+  if (secretVideosLoadingByTab.has(tabId)) {
+    return secretVideosLoadingByTab.get(tabId);
+  }
+  const loading = chrome.storage.session
+    .get(secretVideosStorageKey(tabId))
+    .then((stored) => {
+      const videos = Array.isArray(stored[secretVideosStorageKey(tabId)])
+        ? stored[secretVideosStorageKey(tabId)]
+        : [];
+      secretVideosByTab.set(tabId, videos);
+      return videos;
+    })
+    .finally(() => secretVideosLoadingByTab.delete(tabId));
+  secretVideosLoadingByTab.set(tabId, loading);
+  return loading;
+}
+
+async function setCachedSecretVideos(tabId, videos) {
+  const nextVideos = (Array.isArray(videos) ? videos : []).slice(0, 200);
+  secretVideosByTab.set(tabId, nextVideos);
+  await chrome.storage.session.set({
+    [secretVideosStorageKey(tabId)]: nextVideos,
+  });
+  return nextVideos;
+}
+
+function clearCachedSecretVideos(tabId) {
+  return queueSecretVideoCacheOperation(tabId, async () => {
+    secretVideosByTab.delete(tabId);
+    secretVideosLoadingByTab.delete(tabId);
+    await chrome.storage.session.remove(secretVideosStorageKey(tabId));
+  });
+}
+
+function hasActiveSecretCapture(tabId) {
+  const expiresAt = Number(secretCaptureUntilByTab.get(tabId) || 0);
+  if (expiresAt > Date.now()) return true;
+  if (expiresAt) secretCaptureUntilByTab.delete(tabId);
+  return false;
+}
+
 async function getNetworkMedia(tabId) {
   if (networkMediaByTab.has(tabId)) return networkMediaByTab.get(tabId);
   const stored = await chrome.storage.session.get(networkStorageKey(tabId));
@@ -306,8 +368,8 @@ function detectNetworkMediaCandidate(rawUrl, forcedType = "") {
 
 async function publishNetworkMedia(details, forcedType = "") {
   if (
-    !liveScanSettingLoaded ||
-    !liveScanEnabled ||
+    ((!liveScanSettingLoaded || !liveScanEnabled) &&
+      !hasActiveSecretCapture(details.tabId)) ||
     details.tabId < 0
   ) return;
   const candidate = detectNetworkMediaCandidate(details.url, forcedType);
@@ -360,10 +422,15 @@ chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
     if (details.type === "main_frame") {
       contextMediaByTab.delete(details.tabId);
+      secretCaptureUntilByTab.delete(details.tabId);
       clearNetworkMedia(details.tabId).catch(() => {});
+      clearCachedSecretVideos(details.tabId).catch(() => {});
       return;
     }
-    if (!liveScanSettingLoaded || !liveScanEnabled) return;
+    if (
+      (!liveScanSettingLoaded || !liveScanEnabled) &&
+      !hasActiveSecretCapture(details.tabId)
+    ) return;
     const dashRole = bilibiliDashRole(details.url);
     if (dashRole) {
       publishBilibiliDash(details, dashRole).catch(() => {});
@@ -376,7 +443,10 @@ chrome.webRequest.onBeforeRequest.addListener(
 
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
-    if (!liveScanSettingLoaded || !liveScanEnabled) return;
+    if (
+      (!liveScanSettingLoaded || !liveScanEnabled) &&
+      !hasActiveSecretCapture(details.tabId)
+    ) return;
     const contentType = details.responseHeaders
       ?.find((header) => header.name.toLowerCase() === "content-type")
       ?.value?.toLowerCase();
@@ -407,7 +477,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   networkMediaByTab.delete(tabId);
   contextMediaByTab.delete(tabId);
   bilibiliDashByTab.delete(tabId);
+  secretCaptureUntilByTab.delete(tabId);
   chrome.storage.session.remove(networkStorageKey(tabId)).catch(() => {});
+  clearCachedSecretVideos(tabId).catch(() => {});
 });
 
 async function hasOffscreenDocument() {
@@ -1210,6 +1282,463 @@ function isDouyinHostname(hostname) {
   return normalized === "douyin.com" || normalized.endsWith(".douyin.com");
 }
 
+function secretSiteKindFromHostname(hostname) {
+  const normalized = String(hostname || "").toLowerCase().replace(/\.$/, "");
+  if (normalized === "onlyfans.com" || normalized.endsWith(".onlyfans.com")) {
+    return "onlyfans";
+  }
+  if ([
+    "pornhub.com",
+    "pornhub.org",
+    "pornhub.xxx",
+    "pornhubpremium.com",
+  ].some(
+    (baseHostname) =>
+      normalized === baseHostname || normalized.endsWith(`.${baseHostname}`),
+  )) {
+    return "pornhub";
+  }
+  return "";
+}
+
+function secretSiteKindFromUrl(rawUrl) {
+  try {
+    return secretSiteKindFromHostname(new URL(rawUrl || "").hostname);
+  } catch {
+    return "";
+  }
+}
+
+function secretCandidateFormat(candidate = {}) {
+  const value = `${candidate.format || ""} ${candidate.streamType || ""} ${candidate.url || ""}`.toLowerCase();
+  if (/m3u8|\bhls\b/.test(value)) return "hls";
+  if (/\.webm(?:$|[?#])|\bwebm\b/.test(value)) return "webm";
+  if (/\.mp4(?:$|[?#])|\bmp4\b|\bvideo\b/.test(value)) return "mp4";
+  return "";
+}
+
+function secretCandidateQuality(candidate = {}) {
+  const values = [
+    candidate.quality,
+    candidate.height,
+    candidate.qualityLabel,
+    candidate.label,
+    candidate.url,
+  ];
+  for (const value of values) {
+    const match = String(value || "").match(/(?:^|\D)(\d{3,4})(?:p|\D|$)/i);
+    const quality = Number(match?.[1] || 0);
+    if (quality >= 144 && quality <= 4320) return quality;
+  }
+  return 0;
+}
+
+function secretMediaResourceKey(rawUrl) {
+  const value = String(rawUrl || "").trim();
+  if (!value) return "";
+  try {
+    const url = new URL(value);
+    return `${url.hostname.toLowerCase()}${url.pathname}`;
+  } catch {
+    return value.replace(/[?#].*$/, "");
+  }
+}
+
+function secretCandidateKey(candidate = {}) {
+  const format = secretCandidateFormat(candidate);
+  return `${format}|${secretMediaResourceKey(candidate.url)}`;
+}
+
+function secretVideoKey(video = {}) {
+  const site = String(video.siteKind || video.siteLabel || "").toLowerCase();
+  const id = String(video.id || "").trim();
+  if (id) return `${site}|id:${id}`;
+  const resources = (video.candidates || [])
+    .map(secretCandidateKey)
+    .filter(Boolean)
+    .sort();
+  if (resources.length) return `${site}|media:${resources[0]}`;
+  return `${site}|meta:${String(video.title || "").trim()}|${secretMediaResourceKey(video.cover)}`;
+}
+
+function normalizeSecretCover(rawCover) {
+  const cover = String(rawCover || "").trim();
+  if (/^https?:\/\//i.test(cover)) return cover;
+  if (/^data:image\/(?:jpeg|png|webp);base64,[a-z0-9+/=]+$/i.test(cover)) {
+    return cover.length <= 400_000 ? cover : "";
+  }
+  return "";
+}
+
+function mergeSecretVideoRecords(existingVideos = [], incomingVideos = []) {
+  const videos = existingVideos.filter(Boolean).map((video) => ({
+    ...video,
+    candidates: [...(video.candidates || [])],
+  }));
+  let addedCount = 0;
+  incomingVideos.filter(Boolean).forEach((incoming) => {
+    const incomingResources = new Set(
+      (incoming.candidates || []).map(secretCandidateKey).filter(Boolean),
+    );
+    let index = videos.findIndex(
+      (video) => secretVideoKey(video) === secretVideoKey(incoming),
+    );
+    if (index < 0 && incomingResources.size) {
+      index = videos.findIndex((video) =>
+        (video.candidates || []).some((candidate) =>
+          incomingResources.has(secretCandidateKey(candidate)),
+        ),
+      );
+    }
+    if (index < 0) {
+      videos.push({ ...incoming, candidates: [...(incoming.candidates || [])] });
+      addedCount += 1;
+      return;
+    }
+    const existing = videos[index];
+    const seenCandidates = new Set();
+    const candidates = [...(incoming.candidates || []), ...(existing.candidates || [])]
+      .filter((candidate) => {
+        const key = secretCandidateKey(candidate);
+        if (!key || seenCandidates.has(key)) return false;
+        seenCandidates.add(key);
+        return true;
+      });
+    videos[index] = {
+      ...existing,
+      ...incoming,
+      id: incoming.id || existing.id || "",
+      title: incoming.title || existing.title,
+      cover: incoming.cover || existing.cover,
+      duration: Number(incoming.duration || existing.duration || 0) || 0,
+      pending: candidates.length
+        ? false
+        : Boolean(incoming.pending ?? existing.pending),
+      candidates,
+    };
+  });
+  return { videos, addedCount };
+}
+
+function normalizeSecretVideo(rawVideo, networkItems = [], siteKind = "") {
+  const candidates = [];
+  const seenUrls = new Set();
+  const addCandidate = (rawCandidate) => {
+    const urls = [
+      rawCandidate?.url,
+      ...(Array.isArray(rawCandidate?.fallbackUrls) ? rawCandidate.fallbackUrls : []),
+    ]
+      .map((url) => String(url || "").trim())
+      .filter((url) => /^https?:\/\//i.test(url));
+    const uniqueUrls = [...new Set(urls)];
+    if (!uniqueUrls.length || uniqueUrls.every((url) => seenUrls.has(url))) return;
+    const format = secretCandidateFormat(rawCandidate);
+    if (!format) return;
+    const quality = secretCandidateQuality(rawCandidate);
+    uniqueUrls.forEach((url) => seenUrls.add(url));
+    candidates.push({
+      url: uniqueUrls[0],
+      fallbackUrls: uniqueUrls.slice(1),
+      quality,
+      height: Number(rawCandidate?.height || quality) || 0,
+      width: Number(rawCandidate?.width || 0) || 0,
+      bitrate:
+        Number(rawCandidate?.bitrate || rawCandidate?.bandwidth || 0) || 0,
+      sizeBytes:
+        Number(rawCandidate?.sizeBytes || rawCandidate?.fileSize || 0) || 0,
+      format,
+      streamType: format === "hls" ? "hls" : "",
+      selectable: true,
+      label:
+        String(rawCandidate?.label || "").trim() ||
+        (quality ? `${quality}P · ${format.toUpperCase()}` : format.toUpperCase()),
+    });
+  };
+
+  (Array.isArray(rawVideo?.candidates) ? rawVideo.candidates : []).forEach(addCandidate);
+  (Array.isArray(networkItems) ? networkItems : []).forEach((item) => {
+    if (item?.kind !== "video") return;
+    const hlsUrls = [item.hlsUrl, ...(item.hlsUrls || [])].filter(Boolean);
+    if (hlsUrls.length) {
+      addCandidate({
+        url: hlsUrls[0],
+        fallbackUrls: hlsUrls.slice(1),
+        height: item.height,
+        width: item.width,
+        format: "hls",
+      });
+    }
+    if (item.url && !/^blob:/i.test(item.url) && !hlsUrls.includes(item.url)) {
+      addCandidate({
+        url: item.url,
+        fallbackUrls: [item.fallbackUrl].filter(Boolean),
+        height: item.height,
+        width: item.width,
+        format: item.streamType,
+      });
+    }
+  });
+
+  candidates.sort(
+    (left, right) =>
+      Number(right.quality || 0) - Number(left.quality || 0) ||
+      Number(left.format !== "mp4") - Number(right.format !== "mp4"),
+  );
+  if (!candidates.length) return null;
+  return {
+    id: String(rawVideo?.id || "").trim(),
+    title: String(rawVideo?.title || "当前页面视频").trim(),
+    cover: normalizeSecretCover(rawVideo?.cover),
+    duration: Number(rawVideo?.duration || 0) || 0,
+    pageUrl: String(rawVideo?.pageUrl || ""),
+    siteKind,
+    siteLabel: siteKind === "onlyfans" ? "OnlyFans" : "Pornhub",
+    pending: false,
+    candidates: candidates.slice(0, 30),
+  };
+}
+
+function normalizeSecretVideoUpdate(rawVideo, siteKind, pageUrl = "") {
+  const normalized = normalizeSecretVideo(rawVideo, [], siteKind);
+  if (normalized) {
+    return {
+      ...normalized,
+      pageUrl: String(rawVideo?.pageUrl || pageUrl || ""),
+    };
+  }
+  if (!rawVideo?.pending) return null;
+  return {
+    id: String(rawVideo?.id || "").trim(),
+    title: String(rawVideo?.title || "待捕获的视频"),
+    cover: normalizeSecretCover(rawVideo?.cover),
+    duration: Number(rawVideo?.duration || 0) || 0,
+    pageUrl: String(rawVideo?.pageUrl || pageUrl || ""),
+    siteKind,
+    siteLabel: siteKind === "onlyfans" ? "OnlyFans" : "Pornhub",
+    pending: true,
+    candidates: [],
+  };
+}
+
+function cacheSecretVideoUpdates(tabId, rawVideos, siteKind, pageUrl = "") {
+  return queueSecretVideoCacheOperation(tabId, async () => {
+    const normalized = (Array.isArray(rawVideos) ? rawVideos : [])
+      .map((video) => normalizeSecretVideoUpdate(video, siteKind, pageUrl))
+      .filter(Boolean);
+    if (!normalized.length) {
+      return { videos: await getCachedSecretVideos(tabId), addedCount: 0 };
+    }
+    const existing = await getCachedSecretVideos(tabId);
+    const merged = mergeSecretVideoRecords(existing, normalized);
+    merged.videos = await setCachedSecretVideos(tabId, merged.videos);
+    return merged;
+  });
+}
+
+async function executeSecretExtractorInTab(tabId, siteKind) {
+  const file = siteKind === "onlyfans" ? "onlyfans-main.js" : "pornhub-main.js";
+  if (siteKind === "pornhub") {
+    return {
+      results: await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        files: [file],
+      }),
+      usedTopFrameFallback: false,
+    };
+  }
+  try {
+    return {
+      results: await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        world: "MAIN",
+        files: [file],
+      }),
+      usedTopFrameFallback: false,
+    };
+  } catch (allFramesError) {
+    try {
+      return {
+        results: await chrome.scripting.executeScript({
+          target: { tabId },
+          world: "MAIN",
+          files: [file],
+        }),
+        usedTopFrameFallback: true,
+      };
+    } catch {
+      throw allFramesError;
+    }
+  }
+}
+
+async function readSecretVideosFromTab(tab) {
+  const siteKind = secretSiteKindFromUrl(tab?.url);
+  if (!tab?.id || !siteKind) {
+    throw new Error("当前标签页不是受支持的视频页面。");
+  }
+  secretCaptureUntilByTab.set(tab.id, Date.now() + 30_000);
+  let pageVideo = null;
+  let rawPageVideos = [];
+  let inspectedFrameCount = 0;
+  let extractorResultCount = 0;
+  let injectionFailed = false;
+  let usedTopFrameFallback = false;
+  try {
+    const extraction = await executeSecretExtractorInTab(tab.id, siteKind);
+    const results = extraction.results;
+    usedTopFrameFallback = extraction.usedTopFrameFallback;
+    inspectedFrameCount = Array.isArray(results) ? results.length : 0;
+    const frameVideos = (Array.isArray(results) ? results : [])
+      .filter((entry) => entry?.result && typeof entry.result === "object")
+      .sort((left, right) => Number(left.frameId !== 0) - Number(right.frameId !== 0));
+    extractorResultCount = frameVideos.length;
+    const topVideo = frameVideos.find((entry) => entry.frameId === 0)?.result || null;
+    const candidateVideo = frameVideos.find((entry) => entry.result?.candidates?.length)?.result || null;
+    rawPageVideos = frameVideos.flatMap((entry) =>
+      Array.isArray(entry.result?.videos) && entry.result.videos.length
+        ? entry.result.videos
+        : entry.result?.candidates?.length
+          ? [entry.result]
+          : [],
+    );
+    if (topVideo || candidateVideo) {
+      const metadata = candidateVideo || topVideo;
+      pageVideo = {
+        ...(topVideo || {}),
+        ...(candidateVideo || {}),
+        title: String(candidateVideo?.title || topVideo?.title || tab.title || "当前页面视频"),
+        cover: String(candidateVideo?.cover || topVideo?.cover || ""),
+        duration: Number(candidateVideo?.duration || topVideo?.duration || 0) || 0,
+        pageUrl: tab.url,
+        siteLabel: siteKind === "onlyfans" ? "OnlyFans" : "Pornhub",
+        candidates: frameVideos.flatMap((entry) => entry.result?.candidates || []),
+        unsupportedReason: frameVideos
+          .map((entry) => String(entry.result?.unsupportedReason || ""))
+          .find(Boolean) || String(metadata?.unsupportedReason || ""),
+      };
+    }
+  } catch {
+    injectionFailed = true;
+    // Network media captured from the current tab can still provide a clear stream.
+  }
+  if (!pageVideo?.candidates?.length) {
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+  }
+  const networkItems = await collectTabMedia(tab.id).catch(() => []);
+  const capturedVideoItems = networkItems.filter((item) => item?.kind === "video");
+  const videos = [];
+  const pendingVideos = [];
+  const seenUrls = new Set();
+  const seenPending = new Set();
+  const addVideo = (rawVideo, mediaItems = []) => {
+    const normalized = normalizeSecretVideo(rawVideo, mediaItems, siteKind);
+    if (!normalized?.candidates?.length) {
+      if (!rawVideo?.pending) return;
+      const pendingKey = `${rawVideo.title || ""}\n${rawVideo.cover || ""}`;
+      if (seenPending.has(pendingKey)) return;
+      seenPending.add(pendingKey);
+      pendingVideos.push({
+        title: String(rawVideo.title || "待捕获的视频"),
+        cover: /^https?:\/\//i.test(String(rawVideo.cover || ""))
+          ? String(rawVideo.cover)
+          : "",
+        duration: Number(rawVideo.duration || 0) || 0,
+        pageUrl: tab.url,
+        siteKind,
+        siteLabel: siteKind === "onlyfans" ? "OnlyFans" : "Pornhub",
+        pending: true,
+        candidates: [],
+      });
+      return;
+    }
+    const freshCandidates = normalized.candidates.filter((candidate) => {
+      const urls = [candidate.url, ...(candidate.fallbackUrls || [])];
+      return urls.some((url) => !seenUrls.has(url));
+    });
+    if (!freshCandidates.length) return;
+    freshCandidates.forEach((candidate) => {
+      [candidate.url, ...(candidate.fallbackUrls || [])].forEach((url) => seenUrls.add(url));
+    });
+    videos.push({ ...normalized, candidates: freshCandidates });
+  };
+
+  rawPageVideos.forEach((video) => addVideo(video));
+  if (!rawPageVideos.length && pageVideo) addVideo(pageVideo);
+  if (siteKind !== "pornhub") {
+    capturedVideoItems.forEach((item, index) => {
+      addVideo(
+        {
+          title: `${String(tab.title || "当前页面视频")} · 捕获媒体 ${index + 1}`,
+          cover: String(pageVideo?.cover || ""),
+          duration: Number(pageVideo?.duration || 0) || 0,
+          pageUrl: tab.url,
+        },
+        [item],
+      );
+    });
+  }
+
+  const diagnostics = [
+    `框架 ${inspectedFrameCount}`,
+    `解析结果 ${extractorResultCount}`,
+    `媒体请求 ${capturedVideoItems.length}`,
+    injectionFailed
+      ? "页面脚本注入失败"
+      : usedTopFrameFallback
+        ? "页面脚本已通过主页面回退执行"
+        : "页面脚本已执行",
+  ].join("，");
+  const extractedVideos = mergeSecretVideoRecords([], [
+    ...videos,
+    ...pendingVideos,
+  ]).videos;
+  let allVideos;
+  if (siteKind === "pornhub") {
+    const mainVideo = extractedVideos.find((video) => video?.candidates?.length);
+    allVideos = mainVideo ? [mainVideo] : [];
+    await setCachedSecretVideos(tab.id, allVideos).catch(() => {});
+  } else {
+    try {
+      allVideos = (
+        await cacheSecretVideoUpdates(
+          tab.id,
+          extractedVideos,
+          siteKind,
+          tab.url,
+        )
+      ).videos;
+    } catch {
+      const cachedVideos = await getCachedSecretVideos(tab.id).catch(() => []);
+      allVideos = mergeSecretVideoRecords(cachedVideos, extractedVideos).videos;
+    }
+  }
+  if (!allVideos.length) {
+    throw new Error(
+      `${pageVideo?.unsupportedReason || "没有读取到可下载的视频地址，请先播放视频几秒后重试。"}（诊断：${diagnostics}）`,
+    );
+  }
+  if (allVideos.some((video) => video?.candidates?.length) && !pendingVideos.length) {
+    secretCaptureUntilByTab.delete(tab.id);
+  }
+  const pendingCount = allVideos.filter(
+    (video) => !video?.candidates?.length,
+  ).length;
+  const warning = pendingCount
+    ? `已识别 ${allVideos.length} 个页面视频，其中 ${pendingCount} 个尚未加载媒体地址；播放对应视频后请再次识别。`
+    : "";
+  return { videos: allVideos, warning, diagnostics };
+}
+
+async function readSecretVideoFromTab(tab) {
+  const result = await readSecretVideosFromTab(tab);
+  const video = result.videos.find((item) => item?.candidates?.length);
+  if (!video) {
+    throw new Error(result.warning || "当前页面的视频尚未加载媒体地址。");
+  }
+  return video;
+}
+
 async function readDouyinContentVideoFromTab(tab) {
   if (!tab?.id || !isDouyinHostname(new URL(tab.url || "").hostname)) {
     throw new Error("当前标签页不是抖音网页。");
@@ -1435,6 +1964,63 @@ async function downloadDouyinVideo(
       downloadCover && /^https?:\/\//i.test(String(video.cover || "")),
     coverDownloaded: coverDownloadId !== undefined,
     filename: `${basename}.mp4`,
+  };
+}
+
+async function downloadSecretVideo(tab, rawVideo, preferredIndex = 0) {
+  const siteKind = secretSiteKindFromUrl(tab?.url);
+  if (!tab?.id || !siteKind) {
+    throw new Error("当前标签页不是受支持的视频页面。");
+  }
+  const video = rawVideo?.candidates?.length
+    ? normalizeSecretVideo(rawVideo, [], siteKind)
+    : await readSecretVideoFromTab(tab);
+  const candidates = Array.isArray(video?.candidates) ? video.candidates : [];
+  if (!candidates.length) {
+    throw new Error("当前页面没有可下载的视频地址。");
+  }
+  const selectedIndex = Math.max(
+    0,
+    Math.min(candidates.length - 1, Number(preferredIndex) || 0),
+  );
+  const selected = candidates[selectedIndex];
+  const urls = [...new Set([
+    selected?.url,
+    ...(Array.isArray(selected?.fallbackUrls) ? selected.fallbackUrls : []),
+  ])]
+    .map((url) => String(url || ""))
+    .filter((url) => /^https?:\/\//i.test(url));
+  if (!urls.length) throw new Error("所选画质没有可下载的视频地址。");
+
+  const siteLabel = siteKind === "onlyfans" ? "OnlyFans" : "Pornhub";
+  const basename =
+    sanitizeFilename(video.title || `${siteLabel} 视频`).slice(0, 96).replace(/[ .-]+$/g, "") ||
+    `${siteLabel} 视频`;
+  const format = secretCandidateFormat(selected);
+  if (format === "hls") {
+    const jobId = crypto.randomUUID();
+    await startHlsTask({
+      jobId,
+      items: [{ url: urls[0], urls, name: `${basename}.mp4` }],
+    });
+    await notify(
+      `定格：${siteLabel} 视频处理已启动`,
+      "正在后台读取并合并当前页面的 HLS 视频。",
+    );
+    return { background: true, jobId, filename: `${basename}.mp4` };
+  }
+
+  const extension = format === "webm" ? "webm" : "mp4";
+  const downloadId = await startMediaDownloadWithFallback(
+    urls,
+    `${basename}.${extension}`,
+    `${siteLabel} 视频`,
+  );
+  await notify(`定格：${siteLabel} 视频下载已开始`, `正在保存“${basename}”。`);
+  return {
+    background: false,
+    downloadId,
+    filename: `${basename}.${extension}`,
   };
 }
 
@@ -2268,20 +2854,22 @@ async function readBilibiliPartSizes(
     const results = await Promise.all(
       batch.map(async (part) => {
         try {
-          const play = await bilibiliJson(
-            buildBilibiliPlayPath(
-              {
-                isPgc: Boolean(part.epId || partList.isPgc),
-                bvid: part.bvid || partList.bvid,
-                aid: part.aid || partList.aid,
-                cid: part.cid,
-                epId: part.epId || partList.epId,
-                seasonId: part.seasonId || partList.seasonId,
-                session: partList.session,
-              },
-              qn,
+          const play = normalizeBilibiliPlayData(
+            await bilibiliJson(
+              buildBilibiliPlayPath(
+                {
+                  isPgc: Boolean(part.epId || partList.isPgc),
+                  bvid: part.bvid || partList.bvid,
+                  aid: part.aid || partList.aid,
+                  cid: part.cid,
+                  epId: part.epId || partList.epId,
+                  seasonId: part.seasonId || partList.seasonId,
+                  session: partList.session,
+                },
+                qn,
+              ),
+              tabId,
             ),
-            tabId,
           );
           const progressive = biliProgressiveStreams(play);
           if (progressive.length) {
@@ -2441,6 +3029,58 @@ function collectM3u8Urls(value, result = new Set(), seen = new WeakSet(), depth 
 
 function biliProgressiveStreams(playData) {
   return Array.isArray(playData?.durl) ? playData.durl.filter(biliStreamUrl) : [];
+}
+
+function normalizeBilibiliPlayData(rawPlay = {}) {
+  const candidates = [
+    rawPlay,
+    rawPlay?.video_info,
+    rawPlay?.playurl_info?.playurl,
+    rawPlay?.playurl_info,
+    rawPlay?.playurl,
+  ];
+  return (
+    candidates.find(
+      (candidate) =>
+        candidate &&
+        typeof candidate === "object" &&
+        (candidate.dash ||
+          Array.isArray(candidate.durl) ||
+          Array.isArray(candidate.accept_quality) ||
+          candidate.quality),
+    ) || rawPlay
+  );
+}
+
+function inspectBilibiliPlayProtection(rawPlay = {}) {
+  const play = normalizeBilibiliPlayData(rawPlay);
+  const roots = [rawPlay, play, rawPlay?.video_info, play?.dash].filter(
+    (value) => value && typeof value === "object",
+  );
+  const fields = ["drm_type", "drmType", "drm_tech_type", "drmTechType"];
+  const details = [];
+  roots.forEach((root) => {
+    fields.forEach((field) => {
+      if (root[field] === undefined || root[field] === null || root[field] === "") return;
+      const detail = `${field}=${String(root[field])}`;
+      if (!details.includes(detail)) details.push(detail);
+    });
+  });
+  const encrypted = roots.some((root) =>
+    fields.some((field) => {
+      const value = root[field];
+      if (typeof value === "number") return value > 0;
+      if (typeof value === "boolean") return value;
+      return value !== undefined &&
+        value !== null &&
+        value !== "" &&
+        !/^(?:0|false|none|clear)$/i.test(String(value));
+    }),
+  );
+  const preview = roots.some(
+    (root) => root.is_preview === true || Number(root.is_preview) === 1,
+  );
+  return { encrypted, preview, details };
 }
 
 function biliCodecMatches(stream, codec) {
@@ -2712,10 +3352,12 @@ async function resolveBilibiliDownload(
     seasonId: Number(pgcEpisode?.seasonId || seasonId || 0),
     session: String(pageIdentity.session || ""),
   };
-  const play = await bilibiliJson(
+  const rawPlay = await bilibiliJson(
     buildBilibiliPlayPath(playIdentity, qn),
     resolvedTabId,
   );
+  const play = normalizeBilibiliPlayData(rawPlay);
+  const protection = inspectBilibiliPlayProtection(rawPlay);
   const compatibilityPlays = [];
   if (preferHls || !biliProgressiveStreams(play).length) {
     const compatibilityQueries = [
@@ -2726,10 +3368,10 @@ async function resolveBilibiliDownload(
     for (const query of compatibilityQueries) {
       try {
         compatibilityPlays.push(
-          await bilibiliJson(
+          normalizeBilibiliPlayData(await bilibiliJson(
             buildBilibiliPlayPath(playIdentity, qn, query),
             resolvedTabId,
-          ),
+          )),
         );
       } catch {
         // Individual compatibility modes may be unavailable by region or account.
@@ -2756,6 +3398,24 @@ async function resolveBilibiliDownload(
     ].sort(
       (a, b) => Number(b.size || b.length) - Number(a.size || a.length),
     )[0] || null;
+  if (
+    !hlsUrls.length &&
+    !biliStreamUrl(dashVideo) &&
+    !biliStreamUrl(progressiveVideo) &&
+    protection.encrypted
+  ) {
+    throw new Error(
+      `当前番剧返回了受保护的 DASH 媒体（${protection.details.join("、") || "DRM"}），无法进行本地无损封装。`,
+    );
+  }
+  if (
+    !hlsUrls.length &&
+    !biliStreamUrl(dashVideo) &&
+    !biliStreamUrl(progressiveVideo) &&
+    protection.preview
+  ) {
+    throw new Error("B站接口只返回了试看片段；当前页面会话未取得完整播放权限。");
+  }
   if (!hlsUrls.length && !biliStreamUrl(dashVideo) && !biliStreamUrl(progressiveVideo)) {
     throw new Error("B站没有返回可下载的 DASH 或 MP4 视频流。");
   }
@@ -2898,6 +3558,7 @@ async function resolveBilibiliDownload(
     seasonId: playIdentity.seasonId,
     isPgc,
     tabId: resolvedTabId,
+    protection,
     preferences,
   };
 }
@@ -3641,7 +4302,62 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (
+    message?.type === "DINGGE_SECRET_VIDEOS_UPDATED" &&
+    Number.isInteger(sender.tab?.id) &&
+    Array.isArray(message.videos)
+  ) {
+    const siteKind = secretSiteKindFromUrl(message.pageUrl || sender.tab.url);
+    if (!siteKind) return;
+    cacheSecretVideoUpdates(
+      sender.tab.id,
+      message.videos,
+      siteKind,
+      message.pageUrl || sender.tab.url,
+    )
+      .then(({ addedCount }) => sendResponse({ stored: true, addedCount }))
+      .catch(() => sendResponse({ stored: false, addedCount: 0 }));
+    return true;
+  }
+
   if (message?.target !== "background") return;
+
+  if (message.type === "DINGGE_GET_SECRET_VIDEO") {
+    (async () => {
+      const tabId = Number(sender.tab?.id || message.tabId || 0);
+      const tab = sender.tab || (tabId ? await chrome.tabs.get(tabId) : null);
+      if (!tab?.id) throw new Error("无法取得当前视频标签页。");
+      const result = await readSecretVideosFromTab(tab);
+      const video = result.videos.find((item) => item?.candidates?.length) || result.videos[0];
+      sendResponse({ ok: true, video, ...result });
+    })().catch((error) => {
+      sendResponse({
+        ok: false,
+        error: error?.message || "当前页面视频识别失败。",
+      });
+    });
+    return true;
+  }
+
+  if (message.type === "DINGGE_START_SECRET_DOWNLOAD") {
+    (async () => {
+      const tabId = Number(sender.tab?.id || message.tabId || 0);
+      const tab = sender.tab || (tabId ? await chrome.tabs.get(tabId) : null);
+      if (!tab?.id) throw new Error("无法取得当前视频标签页。");
+      const result = await downloadSecretVideo(
+        tab,
+        message.video,
+        message.preferredIndex,
+      );
+      sendResponse({ started: true, ...result });
+    })().catch((error) => {
+      sendResponse({
+        started: false,
+        error: error?.message || "无法启动当前页面视频下载。",
+      });
+    });
+    return true;
+  }
 
   if (message.type === "DINGGE_GET_DOUYIN_VIDEO") {
     (async () => {

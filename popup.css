@@ -143,15 +143,37 @@ header {
 }
 
 .brand strong {
+  width: 58px;
+  flex: 0 0 58px;
   font-size: 21px;
   letter-spacing: -0.05em;
+  white-space: nowrap;
 }
 
-.brand small {
-  padding-left: 10px;
-  border-left: 1px solid var(--line);
-  font: 700 10px/1 "Courier New", monospace;
-  letter-spacing: 0.14em;
+.brand .secret-entry-button {
+  width: 80px;
+  height: 28px;
+  padding: 0 10px;
+  flex: 0 0 80px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.55);
+  color: var(--ink);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.brand .secret-entry-button:hover,
+.brand .secret-entry-button.active {
+  border-color: var(--ink);
+  background: var(--acid);
+}
+
+.brand .secret-entry-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .version {
@@ -1272,8 +1294,12 @@ body {
   font-size: 14px;
 }
 
-.brand small {
-  font-size: 8px;
+.brand .secret-entry-button {
+  width: 80px;
+  height: 26px;
+  padding: 0 9px;
+  flex-basis: 80px;
+  font-size: 10px;
 }
 
 .current-tab {
@@ -1319,6 +1345,7 @@ body {
 #imagesPanel,
 #screenshotPanel,
 #douyinPanel,
+#secretPanel,
 #bilibiliPanel {
   flex-direction: column;
 }
@@ -1326,12 +1353,29 @@ body {
 #imagesPanel:not([hidden]),
 #screenshotPanel:not([hidden]),
 #douyinPanel:not([hidden]),
+#secretPanel:not([hidden]),
 #bilibiliPanel:not([hidden]) {
   display: flex;
 }
 
 .douyin-panel .panel-intro {
   margin-bottom: 7px;
+}
+
+.secret-settings-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.bili-part-list.secret-video-list {
+  min-height: 54px;
+  max-height: 190px;
+  flex: 0 1 auto;
+}
+
+.bili-part-item.secret-video-item {
+  width: 100%;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
+  text-align: left;
 }
 
 .douyin-scan {
@@ -1372,6 +1416,19 @@ body {
   flex-direction: column;
   justify-content: center;
   gap: 7px;
+}
+
+.secret-panel .douyin-card:has(#secretCover[hidden]) {
+  min-height: 0;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.secret-panel .douyin-card:has(#secretCover[hidden]) > div {
+  gap: 3px;
+}
+
+.secret-panel .douyin-card:has(#secretCover[hidden]) strong {
+  -webkit-line-clamp: 1;
 }
 
 .douyin-card strong {
@@ -1887,6 +1944,21 @@ body {
   overflow-y: auto;
   pointer-events: none;
   box-shadow: 0 5px 18px rgba(19, 38, 31, 0.12);
+}
+
+.message.success {
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 32px;
+  padding: 6px 18px;
+  overflow: hidden;
+  border-width: 1px 0 0;
+  border-radius: 0;
+  line-height: 19px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  box-shadow: 0 -4px 14px rgba(19, 38, 31, 0.08);
 }
 
 .app > footer {

@@ -1,6 +1,6 @@
 # 定格 StillFrame
 
-**当前版本 / Current version: 1.0.2**
+**当前版本 / Current version: 1.0.3**
 
 [版本说明 / Release notes](RELEASE_NOTES.md)
 
@@ -67,6 +67,17 @@ StillFrame 是一款面向 Chrome 及 Chromium 浏览器的网页媒体提取扩
 - 支持扩展面板和右键菜单下载
 - 临时媒体地址只在当前页面与下载流程中使用，不发送到第三方解析服务
 
+### 神秘小入口
+
+- 支持识别当前页面已加载的 MP4、WebM 与 HLS 视频，并在同页存在多个播放器时逐项列出
+- 某视频网站页面会在内存中读取页面自身已经收到的视频元数据，因此接口已下发直链时无需先播放
+- 开启实时扫描后，页面向下加载更多内容时，新捕获的视频会通过页面事件增量保存并加入列表；工具栏弹窗因滚动关闭后，重新打开仍会恢复同一标签页已捕获的视频
+- 尽量读取每个视频所属帖子的标题，并按页面实际提供的清晰度选择视频
+- 画质列表会优先显示页面给出的文件大小；没有明确大小时，根据时长、清晰度和典型码率显示估算值
+- 可保存当前选中的视频
+- HLS 在浏览器本地读取和合并，检测到加密播放列表时会停止并报告保护类型
+- 仅使用当前账户已经能够正常播放的媒体地址，不绕过登录、付费、地区或 DRM 限制
+
 ### B站支持
 
 - 识别当前页面主视频
@@ -81,6 +92,7 @@ StillFrame 是一款面向 Chrome 及 Chromium 浏览器的网页媒体提取扩
 - 支持下载当前视频和打包所选视频
 - 可选择音频、SRT 字幕、ASS 字幕、XML 弹幕和封面
 - 使用本地 Mediabunny 将 DASH 视频轨与音频轨封装为 MP4
+- 可识别 HLS 与 DASH/MP4 中常见的加密和 DRM 标记，并明确报告保护类型
 - 不解锁画质，不伪造会员或购买权限，不绕过登录、付费、地区和 DRM 限制
 
 ### 其他功能
@@ -145,7 +157,19 @@ StillFrame is a local-first media extraction extension for Chrome and Chromium-b
 - Supports selectable video quality, audio quality, and codec options based on the source response.
 - Packages selected Bilibili parts and can include audio, SRT/ASS subtitles, XML danmaku, and cover images.
 - Uses the bundled Mediabunny library locally to mux Bilibili DASH video and audio tracks into MP4 files.
+- Detects common HLS and DASH/MP4 encryption or DRM markers and reports the protection type explicitly.
 - Does not bypass login, payment, membership, regional, access-control, or DRM restrictions.
+
+### Private video entry
+
+- Detects MP4, WebM, and HLS media already loaded by the current page and lists multiple players separately.
+- Reads video metadata already returned by a video website to the page in memory, allowing detection without playback when the API response includes direct media URLs.
+- With live scanning enabled, saves and appends newly captured videos through page events as more content loads; reopening the toolbar popup restores videos captured for the same tab while it was closed.
+- Tries to label every video with its parent post title and lists the quality variants actually exposed by the page.
+- Shows a page-provided file size when available, otherwise estimates each quality's size from duration and a typical bitrate.
+- Lets the user save the currently selected video.
+- Reads and merges clear HLS locally, and stops with an explicit error when an encrypted playlist is detected.
+- Uses only media the current account can already play and does not bypass sign-in, payment, regional, access-control, or DRM restrictions.
 
 ### Privacy and limitations
 

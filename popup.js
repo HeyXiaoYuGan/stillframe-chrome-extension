@@ -33,6 +33,9 @@ const state = {
   biliSizeRequestId: 0,
   douyinVideo: null,
   douyinQualityChoices: [],
+  secretVideo: null,
+  secretVideos: [],
+  secretVideoIndex: -1,
 };
 const pendingImageMeasurements = new Map();
 let imageMeasurementGeneration = 0;
@@ -43,6 +46,7 @@ const elements = {
   openOptionsButton: document.querySelector("#openOptionsButton"),
   openGalleryButton: document.querySelector("#openGalleryButton"),
   featureTabs: [...document.querySelectorAll(".feature-tab")],
+  secretEntryButton: document.querySelector("#secretEntryButton"),
   imagesPanel: document.querySelector("#imagesPanel"),
   screenshotPanel: document.querySelector("#screenshotPanel"),
   douyinPanel: document.querySelector("#douyinPanel"),
@@ -60,6 +64,18 @@ const elements = {
   douyinCoverOption: document.querySelector("#douyinCoverOption"),
   douyinDownloadCover: document.querySelector("#douyinDownloadCover"),
   douyinDownloadButton: document.querySelector("#douyinDownloadButton"),
+  secretPanel: document.querySelector("#secretPanel"),
+  secretScanButton: document.querySelector("#secretScanButton"),
+  secretScanButtonText: document.querySelector("#secretScanButtonText"),
+  secretResults: document.querySelector("#secretResults"),
+  secretEmptyHint: document.querySelector("#secretEmptyHint"),
+  secretCover: document.querySelector("#secretCover"),
+  secretVideoTitle: document.querySelector("#secretVideoTitle"),
+  secretSiteLabel: document.querySelector("#secretSiteLabel"),
+  secretVideoMeta: document.querySelector("#secretVideoMeta"),
+  secretVideoList: document.querySelector("#secretVideoList"),
+  secretQuality: document.querySelector("#secretQuality"),
+  secretDownloadButton: document.querySelector("#secretDownloadButton"),
   bilibiliPanel: document.querySelector("#bilibiliPanel"),
   biliScanButton: document.querySelector("#biliScanButton"),
   biliScanButtonText: document.querySelector("#biliScanButtonText"),
@@ -306,6 +322,14 @@ function setBusy(busy) {
   elements.douyinCodec.disabled =
     busy || elements.douyinCodecField.hidden || elements.douyinCodec.options.length <= 1;
   elements.douyinDownloadCover.disabled = busy || elements.douyinCoverOption.hidden;
+  elements.secretScanButton.disabled = busy;
+  elements.secretEntryButton.disabled = busy;
+  elements.secretVideoList
+    .querySelectorAll("button")
+    .forEach((button) => { button.disabled = busy; });
+  elements.secretQuality.disabled = busy || !state.secretVideo?.candidates?.length;
+  elements.secretDownloadButton.disabled =
+    busy || !state.secretVideo?.candidates?.length;
   elements.biliScanButton.disabled = busy;
   elements.biliDownloadCurrentButton.disabled =
     busy || state.biliParts.length === 0;
@@ -331,8 +355,20 @@ function setBusy(busy) {
 }
 
 async function getActiveTab() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  return tab;
+  const [currentTab] = await chrome.tabs.query({
+    active: true,
+    currentWindow: true,
+  });
+  if (currentTab?.id && canAccessPage(currentTab.url)) return currentTab;
+  const [lastFocusedTab] = await chrome.tabs.query({
+    active: true,
+    lastFocusedWindow: true,
+  });
+  if (lastFocusedTab?.id && canAccessPage(lastFocusedTab.url)) {
+    return lastFocusedTab;
+  }
+  const activeTabs = await chrome.tabs.query({ active: true });
+  return activeTabs.find((tab) => tab?.id && canAccessPage(tab.url)) || currentTab || null;
 }
 
 function canAccessPage(url = "") {
@@ -383,7 +419,7 @@ async function initialize() {
     "biliDownloadDanmaku",
   ]);
   state.mode = preferences.mode === "full" ? "full" : "visible";
-  state.feature = ["images", "screenshot", "douyin", "bilibili"].includes(
+  state.feature = ["images", "screenshot", "douyin", "bilibili", "secret"].includes(
     preferences.feature,
   )
     ? preferences.feature
@@ -431,6 +467,8 @@ async function initialize() {
         await scanBilibiliVideos();
       } else if (state.feature === "douyin") {
         await scanDouyinVideo();
+      } else if (state.feature === "secret") {
+        await scanSecretVideo();
       } else {
         await syncImagesFromPage();
         await syncNetworkMedia();
@@ -542,6 +580,409 @@ function isDouyinPage(url = state.tab?.url || "") {
     return hostname === "douyin.com" || hostname.endsWith(".douyin.com");
   } catch {
     return false;
+  }
+}
+
+function isPornhubHostname(hostname) {
+  const normalized = String(hostname || "").toLowerCase().replace(/\.$/, "");
+  return [
+    "pornhub.com",
+    "pornhub.org",
+    "pornhub.xxx",
+    "pornhubpremium.com",
+  ].some(
+    (baseHostname) =>
+      normalized === baseHostname || normalized.endsWith(`.${baseHostname}`),
+  );
+}
+
+function secretSiteKind(url = state.tab?.url || "") {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    if (hostname === "onlyfans.com" || hostname.endsWith(".onlyfans.com")) {
+      return "onlyfans";
+    }
+    if (isPornhubHostname(hostname)) {
+      return "pornhub";
+    }
+  } catch {
+    // Invalid and protected browser URLs are not supported here.
+  }
+  return "";
+}
+
+function formatSecretDuration(rawSeconds) {
+  const seconds = Math.max(0, Math.round(Number(rawSeconds) || 0));
+  if (!seconds) return "";
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainder = seconds % 60;
+  return hours
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
+    : `${minutes}:${String(remainder).padStart(2, "0")}`;
+}
+
+function secretMediaResourceKey(rawUrl) {
+  const value = String(rawUrl || "").trim();
+  if (!value) return "";
+  try {
+    const url = new URL(value);
+    return `${url.hostname.toLowerCase()}${url.pathname}`;
+  } catch {
+    return value.replace(/[?#].*$/, "");
+  }
+}
+
+function secretCandidateKey(candidate = {}) {
+  const format = String(candidate.format || candidate.streamType || "").toLowerCase();
+  return `${format}|${secretMediaResourceKey(candidate.url)}`;
+}
+
+function secretVideoKey(video = {}) {
+  const site = String(video.siteKind || video.siteLabel || "").toLowerCase();
+  const id = String(video.id || "").trim();
+  if (id) return `${site}|id:${id}`;
+  const resources = (video.candidates || [])
+    .map(secretCandidateKey)
+    .filter(Boolean)
+    .sort();
+  if (resources.length) return `${site}|media:${resources[0]}`;
+  return `${site}|meta:${String(video.title || "").trim()}|${secretMediaResourceKey(video.cover)}`;
+}
+
+function mergeSecretVideoUpdates(existingVideos = [], incomingVideos = []) {
+  const videos = existingVideos.filter(Boolean).map((video) => ({
+    ...video,
+    candidates: [...(video.candidates || [])],
+  }));
+  let addedCount = 0;
+  incomingVideos.filter(Boolean).forEach((incoming) => {
+    const incomingResources = new Set(
+      (incoming.candidates || []).map(secretCandidateKey).filter(Boolean),
+    );
+    let index = videos.findIndex(
+      (video) => secretVideoKey(video) === secretVideoKey(incoming),
+    );
+    if (index < 0 && incomingResources.size) {
+      index = videos.findIndex((video) =>
+        (video.candidates || []).some((candidate) =>
+          incomingResources.has(secretCandidateKey(candidate)),
+        ),
+      );
+    }
+    if (index < 0) {
+      videos.push({ ...incoming, candidates: [...(incoming.candidates || [])] });
+      addedCount += 1;
+      return;
+    }
+    const existing = videos[index];
+    const seenCandidates = new Set();
+    const candidates = [...(incoming.candidates || []), ...(existing.candidates || [])]
+      .filter((candidate) => {
+        const key = secretCandidateKey(candidate);
+        if (!key || seenCandidates.has(key)) return false;
+        seenCandidates.add(key);
+        return true;
+      });
+    videos[index] = {
+      ...existing,
+      ...incoming,
+      id: incoming.id || existing.id || "",
+      title: incoming.title || existing.title,
+      cover: incoming.cover || existing.cover,
+      duration: Number(incoming.duration || existing.duration || 0) || 0,
+      pending: candidates.length ? false : Boolean(incoming.pending ?? existing.pending),
+      candidates,
+    };
+  });
+  return { videos, addedCount };
+}
+
+function secretCandidateQualityNumber(candidate = {}) {
+  const values = [
+    candidate.quality,
+    candidate.height,
+    candidate.label,
+    candidate.url,
+  ];
+  for (const value of values) {
+    const match = String(value || "").match(/(?:^|\D)(\d{3,4})(?:p|\D|$)/i);
+    const quality = Number(match?.[1] || 0);
+    if (quality >= 144 && quality <= 4320) return quality;
+  }
+  return 0;
+}
+
+function secretQualityBitrate(quality) {
+  if (quality <= 0) return 0;
+  if (quality <= 240) return 450_000;
+  if (quality <= 360) return 800_000;
+  if (quality <= 480) return 1_200_000;
+  if (quality <= 540) return 1_600_000;
+  if (quality <= 720) return 2_500_000;
+  if (quality <= 1080) return 5_000_000;
+  if (quality <= 1440) return 9_000_000;
+  if (quality <= 2160) return 18_000_000;
+  return 32_000_000;
+}
+
+function estimateSecretCandidateSize(video = {}, candidate = {}) {
+  const exactSize = Number(
+    candidate.sizeBytes || candidate.fileSize || candidate.contentLength || 0,
+  );
+  if (Number.isFinite(exactSize) && exactSize > 0) {
+    return { sizeBytes: Math.round(exactSize), estimated: false };
+  }
+  const suppliedEstimate = Number(candidate.estimatedSizeBytes || 0);
+  if (Number.isFinite(suppliedEstimate) && suppliedEstimate > 0) {
+    return { sizeBytes: Math.round(suppliedEstimate), estimated: true };
+  }
+  const duration = Number(video.duration || 0);
+  if (!Number.isFinite(duration) || duration <= 0) {
+    return { sizeBytes: 0, estimated: true };
+  }
+  let bitrate = Number(candidate.bitrate || candidate.bandwidth || 0);
+  if (bitrate > 0 && bitrate < 100_000) bitrate *= 1000;
+  if (!Number.isFinite(bitrate) || bitrate <= 0 || bitrate > 1_000_000_000) {
+    bitrate = secretQualityBitrate(secretCandidateQualityNumber(candidate));
+  }
+  if (!bitrate) return { sizeBytes: 0, estimated: true };
+  const audioBitrate = 128_000;
+  return {
+    sizeBytes: Math.round((duration * (bitrate + audioBitrate) * 1.03) / 8),
+    estimated: true,
+  };
+}
+
+function formatSecretFileSize(sizeBytes, estimated = true) {
+  const size = Number(sizeBytes) || 0;
+  if (!size) return "";
+  const value =
+    size >= 1024 ** 3
+      ? `${(size / 1024 ** 3).toFixed(1)} GB`
+      : size >= 1024 ** 2
+        ? `${(size / 1024 ** 2).toFixed(size < 10 * 1024 ** 2 ? 1 : 0)} MB`
+        : `${Math.max(1, Math.round(size / 1024))} KB`;
+  return estimated ? `约 ${value}` : value;
+}
+
+function secretCandidateSizeLabel(video, candidate) {
+  const size = estimateSecretCandidateSize(video, candidate);
+  return formatSecretFileSize(size.sizeBytes, size.estimated);
+}
+
+function secretCandidateDisplayLabel(video, candidate, index = 0) {
+  return [
+    candidate?.label || `可用播放地址 ${index + 1}`,
+    secretCandidateSizeLabel(video, candidate),
+  ].filter(Boolean).join(" · ");
+}
+
+function updateSecretVideoMeta() {
+  if (!state.secretVideo) return;
+  const selected = state.secretVideo.candidates[
+    Number(elements.secretQuality.value) || 0
+  ];
+  const duration = formatSecretDuration(state.secretVideo.duration);
+  const quality = selected?.label || selected?.format?.toUpperCase() || "当前播放流";
+  const size = secretCandidateSizeLabel(state.secretVideo, selected);
+  elements.secretVideoMeta.textContent = [quality, duration, size]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function renderSecretVideo(video, index = -1, preferredCandidateKey = "") {
+  state.secretVideo = video || null;
+  state.secretVideoIndex = video ? index : -1;
+  elements.secretVideoList
+    .querySelectorAll(".secret-video-item")
+    .forEach((row) => {
+      row.classList.toggle("current", Number(row.dataset.index) === index);
+    });
+  elements.secretResults.hidden = !video;
+  elements.secretEmptyHint.hidden = Boolean(video);
+  elements.secretQuality.replaceChildren();
+  if (!state.secretVideo) {
+    elements.secretCover.removeAttribute("src");
+    elements.secretQuality.disabled = true;
+    elements.secretDownloadButton.disabled = true;
+    return;
+  }
+
+  elements.secretVideoTitle.textContent = video.title || "当前页面视频";
+  elements.secretSiteLabel.textContent = "当前网站";
+  if (video.cover) {
+    elements.secretCover.onerror = () => {
+      elements.secretCover.onerror = null;
+      elements.secretCover.removeAttribute("src");
+      elements.secretCover.hidden = true;
+    };
+    elements.secretCover.src = video.cover;
+    elements.secretCover.hidden = false;
+  } else {
+    elements.secretCover.onerror = null;
+    elements.secretCover.removeAttribute("src");
+    elements.secretCover.hidden = true;
+  }
+  (video.candidates || []).forEach((candidate, index) => {
+    const option = document.createElement("option");
+    option.value = String(index);
+    option.textContent = secretCandidateDisplayLabel(video, candidate, index);
+    elements.secretQuality.append(option);
+  });
+  const hasCandidates = Boolean(video.candidates?.length);
+  if (!hasCandidates) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "播放该视频后重新识别";
+    elements.secretQuality.append(option);
+    elements.secretVideoMeta.textContent = "等待页面加载媒体地址";
+  } else {
+    const preferredIndex = video.candidates.findIndex(
+      (candidate) => secretCandidateKey(candidate) === preferredCandidateKey,
+    );
+    if (preferredIndex >= 0) elements.secretQuality.value = String(preferredIndex);
+    updateSecretVideoMeta();
+  }
+  elements.secretQuality.disabled = state.busy || !hasCandidates;
+  elements.secretDownloadButton.disabled = state.busy || !hasCandidates;
+}
+
+function renderSecretVideos(
+  rawVideos,
+  preferredVideoKey = "",
+  preferredCandidateKey = "",
+) {
+  state.secretVideos = (Array.isArray(rawVideos) ? rawVideos : []).filter(Boolean);
+  elements.secretVideoList.replaceChildren();
+  if (!state.secretVideos.length) {
+    renderSecretVideo(null);
+    return;
+  }
+  state.secretVideos.forEach((video, index) => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "bili-part-item secret-video-item";
+    row.dataset.index = String(index);
+    const number = document.createElement("span");
+    number.className = "bili-part-number";
+    number.textContent = `V${index + 1}`;
+    const name = document.createElement("span");
+    name.className = "bili-part-name";
+    name.textContent = String(video.title || `页面视频 ${index + 1}`);
+    name.title = name.textContent;
+    const meta = document.createElement("span");
+    meta.className = "bili-part-meta";
+    const status = document.createElement("span");
+    status.className = "bili-part-size";
+    const firstCandidate = video.candidates?.[0];
+    const sizeLabel = firstCandidate
+      ? secretCandidateSizeLabel(video, firstCandidate)
+      : "";
+    status.textContent = video.candidates?.length
+      ? [`${video.candidates.length} 个清晰度`, sizeLabel]
+          .filter(Boolean)
+          .join(" · ")
+      : "待播放";
+    const duration = document.createElement("span");
+    duration.textContent = formatSecretDuration(video.duration) || video.siteLabel || "";
+    meta.append(duration, status);
+    row.append(number, name, meta);
+    row.addEventListener("click", () => renderSecretVideo(video, index));
+    elements.secretVideoList.append(row);
+  });
+  const preferredIndex = preferredVideoKey
+    ? state.secretVideos.findIndex(
+        (video) => secretVideoKey(video) === preferredVideoKey,
+      )
+    : -1;
+  const initialIndex = preferredIndex >= 0
+    ? preferredIndex
+    : Math.max(
+        0,
+        state.secretVideos.findIndex((video) => video?.candidates?.length),
+      );
+  renderSecretVideo(
+    state.secretVideos[initialIndex],
+    initialIndex,
+    preferredIndex >= 0 ? preferredCandidateKey : "",
+  );
+}
+
+async function scanSecretVideo() {
+  if (state.busy) return;
+  state.tab = await getActiveTab();
+  state.pageUrl = state.tab?.url || "";
+  if (!state.tab?.id || !secretSiteKind(state.tab.url)) {
+    renderSecretVideos([]);
+    showMessage("请打开你想打开的网站并尝试", "error");
+    return;
+  }
+  setBusy(true);
+  showMessage("");
+  elements.secretScanButtonText.textContent = "正在识别当前页面视频…";
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "DINGGE_GET_SECRET_VIDEO",
+      target: "background",
+      tabId: state.tab.id,
+    });
+    const videos = Array.isArray(response?.videos)
+      ? response.videos
+      : response?.video
+        ? [response.video]
+        : [];
+    if (!response?.ok || !videos.length) {
+      throw new Error(response?.error || "没有读取到可下载的视频地址，请先播放视频几秒后重试。");
+    }
+    renderSecretVideos(videos);
+    elements.secretScanButtonText.textContent = "重新识别当前页面视频";
+    const downloadableCount = videos.filter((video) => video?.candidates?.length).length;
+    showMessage(
+      response.warning ||
+        `已识别 ${videos.length} 个页面视频，其中 ${downloadableCount} 个可下载。`,
+      downloadableCount ? "success" : "error",
+    );
+  } catch (error) {
+    renderSecretVideos([]);
+    elements.secretScanButtonText.textContent = "识别当前页面视频";
+    showMessage(error?.message || "当前页面视频识别失败。", "error");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function startSecretDownload() {
+  if (state.busy || !state.tab?.id || !state.secretVideo?.candidates?.length) return;
+  setBusy(true);
+  showMessage("");
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "DINGGE_START_SECRET_DOWNLOAD",
+      target: "background",
+      tabId: state.tab.id,
+      video: state.secretVideo,
+      preferredIndex: Number(elements.secretQuality.value) || 0,
+    });
+    if (!response?.started) {
+      throw new Error(response?.error || "无法启动当前视频下载。");
+    }
+    if (response.background && response.jobId) {
+      state.backgroundJobId = response.jobId;
+      state.hlsJobId = response.jobId;
+      elements.cancelJobButton.hidden = false;
+      setProgress(4, "已找到 HLS，正在读取播放列表…");
+    }
+    showMessage(
+      response.background
+        ? "视频正在后台读取并合并，可在此查看进度。"
+        : "视频已交给 Chrome 下载管理器。",
+      "success",
+    );
+  } catch (error) {
+    showMessage(error?.message || "无法启动当前视频下载。", "error");
+  } finally {
+    if (!state.backgroundJobId) setBusy(false);
   }
 }
 
@@ -1062,9 +1503,15 @@ function updateFeature(feature) {
   elements.featureTabs.forEach((button) => {
     button.classList.toggle("active", button.dataset.feature === feature);
   });
+  elements.secretEntryButton.classList.toggle("active", feature === "secret");
+  elements.secretEntryButton.setAttribute(
+    "aria-pressed",
+    feature === "secret" ? "true" : "false",
+  );
   elements.imagesPanel.hidden = feature !== "images";
   elements.screenshotPanel.hidden = feature !== "screenshot";
   elements.douyinPanel.hidden = feature !== "douyin";
+  elements.secretPanel.hidden = feature !== "secret";
   elements.bilibiliPanel.hidden = feature !== "bilibili";
   if (feature !== "images") closeImagePreview();
   showMessage("");
@@ -1077,6 +1524,13 @@ function updateFeature(feature) {
     !state.busy
   ) {
     scanDouyinVideo();
+  } else if (
+    feature === "secret" &&
+    state.tab?.id &&
+    !state.secretVideo &&
+    !state.busy
+  ) {
+    scanSecretVideo();
   } else if (
     feature === "bilibili" &&
     state.tab?.id &&
@@ -2742,6 +3196,7 @@ async function captureScreenshot() {
 elements.featureTabs.forEach((button) => {
   button.addEventListener("click", () => updateFeature(button.dataset.feature));
 });
+elements.secretEntryButton.addEventListener("click", () => updateFeature("secret"));
 elements.openGalleryButton.addEventListener("click", openMediaGallery);
 elements.imageFilterLevelSelect.addEventListener("change", () => {
   const imageFilterLevel = normalizeImageFilterLevel(
@@ -2767,6 +3222,9 @@ elements.douyinDownloadCover.addEventListener("change", () => {
     .set({ douyinDownloadCover: elements.douyinDownloadCover.checked })
     .catch(() => {});
 });
+elements.secretScanButton.addEventListener("click", scanSecretVideo);
+elements.secretDownloadButton.addEventListener("click", startSecretDownload);
+elements.secretQuality.addEventListener("change", updateSecretVideoMeta);
 elements.biliScanButton.addEventListener("click", scanBilibiliVideos);
 [elements.biliQuality, elements.biliAudioQuality, elements.biliCodec, elements.biliAudio]
   .forEach((control) => {
@@ -2855,6 +3313,32 @@ chrome.storage.onChanged?.addListener((changes, areaName) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender) => {
+  if (message?.type === "DINGGE_SECRET_VIDEOS_UPDATED") {
+    if (
+      state.feature !== "secret" ||
+      sender.tab?.id !== state.tab?.id ||
+      !Array.isArray(message.videos)
+    ) return;
+    const selectedVideoKey = secretVideoKey(state.secretVideo);
+    const selectedCandidate = state.secretVideo?.candidates?.[
+      Number(elements.secretQuality.value) || 0
+    ];
+    const merged = mergeSecretVideoUpdates(state.secretVideos, message.videos);
+    renderSecretVideos(
+      merged.videos,
+      selectedVideoKey,
+      secretCandidateKey(selectedCandidate),
+    );
+    if (merged.addedCount > 0) {
+      elements.secretScanButtonText.textContent = "重新识别当前页面视频";
+      showMessage(
+        `新发现 ${merged.addedCount} 个页面视频，已自动加入列表。`,
+        "success",
+      );
+    }
+    return;
+  }
+
   if (message?.type === "DINGGE_JOB_STATUS") {
     if (message.job) {
       showBackgroundJob(message.job);

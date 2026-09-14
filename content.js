@@ -62,6 +62,60 @@
     }
   }
 
+  if (
+    location.hostname === "onlyfans.com" ||
+    location.hostname.endsWith(".onlyfans.com")
+  ) {
+    window.addEventListener("message", (event) => {
+      const payload = event.data;
+      if (
+        event.source !== window ||
+        payload?.source !== "stillframe-onlyfans-hook" ||
+        payload?.type !== "records-updated" ||
+        !Array.isArray(payload.records)
+      ) return;
+      if (!liveScanEnabled) return;
+      const videos = payload.records.slice(0, 20).map((record) => ({
+        id: String(record?.id || ""),
+        title: String(record?.title || "OnlyFans 视频"),
+        cover: /^https?:\/\//i.test(String(record?.cover || ""))
+          ? String(record.cover)
+          : "",
+        duration: Number(record?.duration || 0) || 0,
+        pageUrl: location.href,
+        siteKind: "onlyfans",
+        siteLabel: "OnlyFans",
+        pending: false,
+        candidates: (Array.isArray(record?.candidates) ? record.candidates : [])
+          .slice(0, 30)
+          .filter((candidate) => /^https?:\/\//i.test(String(candidate?.url || "")))
+          .map((candidate) => ({
+            url: String(candidate.url),
+            fallbackUrls: Array.isArray(candidate.fallbackUrls)
+              ? candidate.fallbackUrls.filter((url) => /^https?:\/\//i.test(String(url)))
+              : [],
+            quality: Number(candidate.quality || 0) || 0,
+            height: Number(candidate.height || 0) || 0,
+            width: Number(candidate.width || 0) || 0,
+            bitrate: Number(candidate.bitrate || candidate.bandwidth || 0) || 0,
+            sizeBytes:
+              Number(candidate.sizeBytes || candidate.fileSize || 0) || 0,
+            format: String(candidate.format || ""),
+            streamType: String(candidate.streamType || ""),
+            selectable: true,
+            label: String(candidate.label || ""),
+          })),
+      })).filter((video) => video.candidates.length);
+      if (!videos.length) return;
+      safeRuntimeSendMessage({
+        type: "DINGGE_SECRET_VIDEOS_UPDATED",
+        pageUrl: location.href,
+        updatedAt: Number(payload.updatedAt || Date.now()),
+        videos,
+      }).catch(() => {});
+    });
+  }
+
   async function safeLocalStorageGet(defaults) {
     if (!hasExtensionContext()) {
       invalidateExtensionContext();

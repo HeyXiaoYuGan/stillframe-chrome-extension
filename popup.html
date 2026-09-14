@@ -13,7 +13,14 @@
           <span class="brand-mark" aria-hidden="true"><i></i></span>
           <div>
             <strong>定格</strong>
-            <small>SNAPSHOT</small>
+            <button
+              class="secret-entry-button"
+              id="secretEntryButton"
+              type="button"
+              data-feature="secret"
+            >
+              神秘入口
+            </button>
           </div>
         </div>
         <div class="header-actions">
@@ -22,7 +29,7 @@
             <option value="en">English</option>
           </select>
           <button id="openOptionsButton" type="button">设置</button>
-          <span class="version" id="versionLabel">V1.0.2</span>
+          <span class="version" id="versionLabel">V1.0.3</span>
         </div>
       </header>
 
@@ -213,6 +220,45 @@
           <span class="scan-frame" aria-hidden="true"><i></i></span>
           <strong>等待识别抖音视频</strong>
           <p>支持 douyin.com 的视频作品页面</p>
+        </div>
+      </section>
+
+      <section class="feature-panel douyin-panel secret-panel" id="secretPanel" hidden>
+        <div class="panel-intro compact">
+          <h2>神秘入口</h2>
+          <p>识别当前页面中可直接保存的视频。</p>
+        </div>
+
+        <button class="primary-button douyin-scan" id="secretScanButton" type="button">
+          <span id="secretScanButtonText">识别当前页面视频</span>
+          <b aria-hidden="true">→</b>
+        </button>
+
+        <div class="douyin-results" id="secretResults" hidden>
+          <article class="douyin-card">
+            <img id="secretCover" alt="当前视频封面" />
+            <div>
+              <strong id="secretVideoTitle">当前页面视频</strong>
+              <small id="secretSiteLabel">当前网站</small>
+              <span id="secretVideoMeta">等待读取视频信息</span>
+            </div>
+          </article>
+          <div class="bili-part-list secret-video-list" id="secretVideoList"></div>
+          <div class="douyin-settings-grid secret-settings-grid">
+            <label class="douyin-quality">下载画质
+              <select id="secretQuality"></select>
+            </label>
+          </div>
+          <button class="douyin-download" id="secretDownloadButton" type="button">
+            下载当前视频
+          </button>
+          <small class="douyin-note">仅保存当前账户可正常播放的未加密媒体，不绕过登录、付费、地区或 DRM 限制。</small>
+        </div>
+
+        <div class="empty-hint douyin-empty" id="secretEmptyHint">
+          <span class="scan-frame" aria-hidden="true"><i></i></span>
+          <strong>等待识别当前视频</strong>
+          <p>请打开你想打开的网站并尝试</p>
         </div>
       </section>
 

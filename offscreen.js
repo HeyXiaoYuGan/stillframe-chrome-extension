@@ -366,6 +366,31 @@ function parseHlsAttributes(line) {
   return attributes;
 }
 
+function inspectHlsProtection(lines = []) {
+  const protectedKeys = lines
+    .filter(
+      (line) => line.startsWith("#EXT-X-KEY:") && !/METHOD=NONE(?:,|$)/i.test(line),
+    )
+    .map(parseHlsAttributes);
+  if (!protectedKeys.length) return { encrypted: false, methods: [], systems: [] };
+  const methods = [...new Set(protectedKeys.map((key) => key.METHOD).filter(Boolean))];
+  const systems = [
+    ...new Set(
+      protectedKeys
+        .map((key) => String(key.KEYFORMAT || "").toLowerCase())
+        .map((format) => {
+          if (!format || format === "identity") return "AES key URI";
+          if (format.includes("edef8ba9") || format.includes("widevine")) return "Widevine";
+          if (format.includes("9a04f079") || format.includes("playready")) return "PlayReady";
+          if (format.includes("streamingkeydelivery") || format.includes("fairplay")) return "FairPlay";
+          return format;
+        })
+        .filter(Boolean),
+    ),
+  ];
+  return { encrypted: true, methods, systems };
+}
+
 async function fetchHlsText(url, signal) {
   const response = await fetchWithTimeout(url, {
     credentials: "include",
@@ -412,12 +437,12 @@ function concatenateBytes(chunks, totalLength) {
 
 async function fetchHlsVideo(url, onProgress = () => {}, signal) {
   const playlist = await resolveHlsMediaPlaylist(url, 0, signal);
-  if (
-    playlist.lines.some(
-      (line) => line.startsWith("#EXT-X-KEY:") && !/METHOD=NONE(?:,|$)/i.test(line),
-    )
-  ) {
-    throw new Error("该 HLS 视频使用了加密分片，当前版本无法合并。");
+  const protection = inspectHlsProtection(playlist.lines);
+  if (protection.encrypted) {
+    const details = [...protection.methods, ...protection.systems].join(" / ");
+    throw new Error(
+      `检测到 HLS 加密（${details || "EXT-X-KEY"}）；当前版本仅识别保护方式，不提取密钥或解密分片。`,
+    );
   }
 
   const resources = [];
@@ -681,6 +706,73 @@ async function fetchFirstMediaBlob(urls, label, signal) {
   throw new Error(`${label}读取失败：${lastError?.message || "没有可用 CDN"}`);
 }
 
+const ISO_BMFF_PROTECTION_SYSTEMS = {
+  edef8ba979d64acea3c827dcd51d21ed: "Widevine",
+  "9a04f07998404286ab92e65be0885f95": "PlayReady",
+  "94ce86fb07ff4f43adb893d2fa968ca2": "FairPlay",
+  "1077efecc0b24d02ace33c1e52e2fb4b": "Common PSSH / ClearKey",
+  f239e769efa348509c16a903c6932efb: "Adobe Primetime",
+};
+
+function readIsoBmffFourCc(bytes, offset) {
+  if (offset < 0 || offset + 4 > bytes.length) return "";
+  return String.fromCharCode(
+    bytes[offset],
+    bytes[offset + 1],
+    bytes[offset + 2],
+    bytes[offset + 3],
+  );
+}
+
+function findIsoBmffBoxes(bytes, type) {
+  const matches = [];
+  for (let offset = 4; offset + 4 <= bytes.length; offset += 1) {
+    if (readIsoBmffFourCc(bytes, offset) !== type) continue;
+    const boxStart = offset - 4;
+    const size = new DataView(bytes.buffer, bytes.byteOffset + boxStart, 4).getUint32(0);
+    if (size !== 0 && size !== 1 && (size < 8 || boxStart + size > bytes.length)) continue;
+    matches.push({ boxStart, typeOffset: offset, size });
+  }
+  return matches;
+}
+
+function inspectIsoBmffProtectionBytes(bytes) {
+  const schemes = [];
+  for (const box of findIsoBmffBoxes(bytes, "schm")) {
+    const scheme = readIsoBmffFourCc(bytes, box.typeOffset + 8).toLowerCase();
+    if (["cenc", "cens", "cbc1", "cbcs"].includes(scheme) && !schemes.includes(scheme)) {
+      schemes.push(scheme);
+    }
+  }
+  const systems = [];
+  for (const box of findIsoBmffBoxes(bytes, "pssh")) {
+    const start = box.typeOffset + 8;
+    if (start + 16 > bytes.length) continue;
+    const systemId = [...bytes.slice(start, start + 16)]
+      .map((value) => value.toString(16).padStart(2, "0"))
+      .join("");
+    const label = ISO_BMFF_PROTECTION_SYSTEMS[systemId] || `PSSH ${systemId}`;
+    if (!systems.includes(label)) systems.push(label);
+  }
+  const boxes = ["encv", "enca", "sinf", "tenc", "senc"].filter(
+    (type) => findIsoBmffBoxes(bytes, type).length > 0,
+  );
+  return {
+    encrypted: Boolean(schemes.length || systems.length || boxes.length),
+    schemes,
+    systems,
+    boxes,
+  };
+}
+
+async function inspectIsoBmffProtection(source) {
+  const blob = source instanceof Blob ? source : new Blob([source]);
+  const header = new Uint8Array(
+    await blob.slice(0, Math.min(blob.size, 4 * 1024 * 1024)).arrayBuffer(),
+  );
+  return inspectIsoBmffProtectionBytes(header);
+}
+
 async function createTemporaryMediaTarget(jobId) {
   if (!navigator.storage?.getDirectory) {
     throw new Error("当前 Chrome 不支持磁盘流式视频合并，请升级浏览器后重试。");
@@ -719,6 +811,30 @@ async function muxDashMedia(
       ? audioSource
       : new Blob([audioSource], { type: "audio/mp4" })
     : null;
+  const [videoProtection, audioProtection] = await Promise.all([
+    inspectIsoBmffProtection(videoBlob),
+    audioBlob
+      ? inspectIsoBmffProtection(audioBlob)
+      : Promise.resolve({ encrypted: false, schemes: [], systems: [], boxes: [] }),
+  ]);
+  const protectedTracks = [
+    ["视频", videoProtection],
+    ["音频", audioProtection],
+  ].filter(([, protection]) => protection.encrypted);
+  if (protectedTracks.length) {
+    const details = protectedTracks
+      .map(([label, protection]) =>
+        `${label}：${[
+          ...protection.schemes.map((scheme) => scheme.toUpperCase()),
+          ...protection.systems,
+          ...protection.boxes,
+        ].join(" / ")}`,
+      )
+      .join("；");
+    throw new Error(
+      `检测到受保护的 DASH/MP4 轨道（${details}）。当前版本仅识别加密方式，不提取许可证或解密媒体。`,
+    );
+  }
   const videoInput = new Input({
     source: new BlobSource(videoBlob),
     formats: ALL_FORMATS,
