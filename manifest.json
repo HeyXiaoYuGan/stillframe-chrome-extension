@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "定格 StillFrame",
-  "version": "1.0.3",
-  "minimum_chrome_version": "109",
+  "version": "1.0.4",
+  "minimum_chrome_version": "116",
   "description": "在本地扫描网页图片与媒体，支持截图、打包及 Pinterest、抖音、B站保存工具。",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqWip6sZkz+05asebjdc+OobFQBkpoWzNfsCitil7eT/rzc/4lgKWR9S0YEvKj1mh9sEgLSl5Fv3JQxcKjZiSTnCSw+yd3MekPrlw6XhLzkYSBXUsD9KgkFHHNRH6YwBMptoiIpBnSCzVV3+H65Afhf5Gl+AprVCXKu7HV53htUaPVDZ03HGfN8K3b/UuDycMafp0tJZDhYo08N0GdeLh02zaJw3q/DNBkxBN7oOdhMjl9lLOalNwlUhu1umAnupl+VpwZR0l+jNrpRFHVOhQsLyPmxC5yl4pMT7hR+f98jX5GeaEyrlWFgmb4FCXMHPeHc2ZNTtSDmxzJxnWIvGcrwIDAQAB",
   "permissions": [
@@ -11,6 +11,7 @@
     "downloads",
     "notifications",
     "offscreen",
+    "sidePanel",
     "scripting",
     "storage",
     "webRequest"
@@ -45,6 +46,17 @@
       "run_at": "document_start"
     }
   ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "vendor/mediabunny/mediabunny.min.mjs"
+      ],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ]
+    }
+  ],
   "action": {
     "default_title": "定格 StillFrame",
     "default_popup": "popup.html",
@@ -54,6 +66,9 @@
       "48": "icon-48.png",
       "128": "icon-128.png"
     }
+  },
+  "side_panel": {
+    "default_path": "popup.html?surface=sidepanel"
   },
   "options_ui": {
     "page": "options.html",

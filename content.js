@@ -116,6 +116,23 @@
     });
   }
 
+  globalThis.addEventListener?.("message", (event) => {
+    const payload = event.data;
+    if (
+      event.source !== globalThis ||
+      payload?.source !== "stillframe-page-media" ||
+      payload?.type !== "progress" ||
+      !/^[a-zA-Z0-9-]{8,80}$/.test(String(payload.jobId || ""))
+    ) return;
+    safeRuntimeSendMessage({
+      type: "DINGGE_PAGE_MEDIA_PROGRESS",
+      target: "background",
+      jobId: String(payload.jobId),
+      percent: Math.max(0, Math.min(100, Number(payload.percent) || 0)),
+      text: String(payload.text || "正在读取当前页面视频…").slice(0, 120),
+    }).catch(() => {});
+  });
+
   async function safeLocalStorageGet(defaults) {
     if (!hasExtensionContext()) {
       invalidateExtensionContext();

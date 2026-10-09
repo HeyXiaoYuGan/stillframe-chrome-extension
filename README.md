@@ -1,6 +1,6 @@
 # 定格 StillFrame
 
-**当前版本 / Current version: 1.0.3**
+**当前版本 / Current version: 1.0.4**
 
 [版本说明 / Release notes](RELEASE_NOTES.md)
 

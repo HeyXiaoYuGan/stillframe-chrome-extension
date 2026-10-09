@@ -391,6 +391,23 @@ function inspectHlsProtection(lines = []) {
   return { encrypted: true, methods, systems };
 }
 
+function resolveHlsResourceUrl(rawUrl, baseUrl) {
+  const base = new URL(baseUrl);
+  const resolved = new URL(String(rawUrl || "").trim(), base);
+  if (resolved.origin === base.origin && base.search) {
+    for (const [key, value] of base.searchParams) {
+      if (!resolved.searchParams.has(key)) resolved.searchParams.append(key, value);
+    }
+  }
+  return resolved.href;
+}
+
+function hlsResourceUrlCandidates(rawUrl, baseUrl) {
+  const standardUrl = new URL(String(rawUrl || "").trim(), baseUrl).href;
+  const inheritedUrl = resolveHlsResourceUrl(rawUrl, baseUrl);
+  return [...new Set([standardUrl, inheritedUrl])];
+}
+
 async function fetchHlsText(url, signal) {
   const response = await fetchWithTimeout(url, {
     credentials: "include",
@@ -401,12 +418,26 @@ async function fetchHlsText(url, signal) {
   if (!text.trimStart().startsWith("#EXTM3U")) {
     throw new Error("资源不是有效的 m3u8 播放列表。");
   }
-  return text;
+  return { text, url: response.url || url };
 }
 
 async function resolveHlsMediaPlaylist(url, depth = 0, signal) {
   if (depth > 4) throw new Error("HLS 主播放列表嵌套过深。");
-  const text = await fetchHlsText(url, signal);
+  const candidates = Array.isArray(url) ? url : [url];
+  let fetched;
+  let lastError;
+  for (const candidate of candidates) {
+    try {
+      fetched = await fetchHlsText(candidate, signal);
+      break;
+    } catch (error) {
+      lastError = error;
+      if (signal?.aborted) throw error;
+    }
+  }
+  if (!fetched) throw lastError || new Error("HLS 播放列表读取失败。");
+  const { text } = fetched;
+  const playlistUrl = fetched.url;
   const lines = text.split(/\r?\n/).map((line) => line.trim());
   const variants = [];
   for (let index = 0; index < lines.length; index += 1) {
@@ -415,14 +446,53 @@ async function resolveHlsMediaPlaylist(url, depth = 0, signal) {
     const nextLine = lines.slice(index + 1).find((line) => line && !line.startsWith("#"));
     if (!nextLine) continue;
     variants.push({
-      url: new URL(nextLine, url).href,
+      urls: hlsResourceUrlCandidates(nextLine, playlistUrl),
       bandwidth: Number(attributes.BANDWIDTH) || 0,
       resolution: attributes.RESOLUTION || "",
     });
   }
-  if (!variants.length) return { url, text, lines };
+  if (!variants.length) return { url: playlistUrl, text, lines };
   variants.sort((a, b) => b.bandwidth - a.bandwidth);
-  return resolveHlsMediaPlaylist(variants[0].url, depth + 1, signal);
+  return resolveHlsMediaPlaylist(variants[0].urls, depth + 1, signal);
+}
+
+async function fetchHlsResourceViaTab(tabId, urls, range, signal) {
+  if (!tabId || signal?.aborted) return null;
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "DINGGE_FETCH_HLS_RESOURCE_FROM_TAB",
+      target: "background",
+      tabId,
+      urls,
+      range,
+    });
+    if (!response?.ok || !response.base64 || signal?.aborted) return null;
+    const binary = atob(response.base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchHlsPlaylistViaTab(tabId, url, signal) {
+  if (!tabId || signal?.aborted) return null;
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "DINGGE_FETCH_HLS_PLAYLIST_FROM_TAB",
+      target: "background",
+      tabId,
+      url,
+    });
+    return response?.ok && response.playlist?.text && !signal?.aborted
+      ? response.playlist
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function concatenateBytes(chunks, totalLength) {
@@ -435,8 +505,22 @@ function concatenateBytes(chunks, totalLength) {
   return merged;
 }
 
-async function fetchHlsVideo(url, onProgress = () => {}, signal) {
-  const playlist = await resolveHlsMediaPlaylist(url, 0, signal);
+async function fetchHlsVideo(
+  url,
+  onProgress = () => {},
+  signal,
+  prefetchedPlaylist = null,
+  sourceTabId = 0,
+  jobId = "",
+) {
+  const playlist =
+    prefetchedPlaylist?.text?.trimStart().startsWith("#EXTM3U")
+      ? {
+          url: prefetchedPlaylist.url || url,
+          text: prefetchedPlaylist.text,
+          lines: prefetchedPlaylist.text.split(/\r?\n/).map((line) => line.trim()),
+        }
+      : await resolveHlsMediaPlaylist(url, 0, signal);
   const protection = inspectHlsProtection(playlist.lines);
   if (protection.encrypted) {
     const details = [...protection.methods, ...protection.systems].join(" / ");
@@ -458,7 +542,7 @@ async function fetchHlsVideo(url, onProgress = () => {}, signal) {
         const length = Number(lengthText) || 0;
         const start = Number(offsetText) || 0;
         resources.push({
-          url: new URL(attributes.URI, playlist.url).href,
+          urls: hlsResourceUrlCandidates(attributes.URI, playlist.url),
           range: length ? { start, length } : null,
         });
         hasInitSegment = true;
@@ -478,7 +562,7 @@ async function fetchHlsVideo(url, onProgress = () => {}, signal) {
     }
     if (!line || line.startsWith("#")) continue;
     resources.push({
-      url: new URL(line, playlist.url).href,
+      urls: hlsResourceUrlCandidates(line, playlist.url),
       range: pendingByteRange,
     });
     if (pendingByteRange) {
@@ -490,22 +574,47 @@ async function fetchHlsVideo(url, onProgress = () => {}, signal) {
   if (!resources.length) throw new Error("m3u8 播放列表中没有可下载的分片。");
   if (resources.length > 3000) throw new Error("HLS 分片超过 3000 个，已停止处理。");
 
-  const chunks = [];
+  const firstMediaPath = new URL(
+    resources[hasInitSegment ? 1 : 0]?.urls?.[0] || resources[0].urls[0],
+  ).pathname;
+  const extension =
+    hasInitSegment || /\.(?:m4s|mp4)$/i.test(firstMediaPath) ? "mp4" : "ts";
+  const diskTarget = jobId && navigator.storage?.getDirectory
+    ? await createTemporaryMediaTarget(`${jobId}-hls`)
+    : null;
+  const chunks = diskTarget ? null : new Array(resources.length);
   let totalLength = 0;
-  for (let index = 0; index < resources.length; index += 1) {
-    onProgress(index, resources.length);
-    const resource = resources[index];
-    const response = await fetchWithTimeout(resource.url, {
-      credentials: "include",
-      cache: "force-cache",
-      headers: resource.range
-        ? {
-            Range: `bytes=${resource.range.start}-${resource.range.start + resource.range.length - 1}`,
-          }
-        : undefined,
-    }, 30000, signal);
-    if (!response.ok) {
-      throw new Error(`HLS 分片 ${index + 1} 读取失败（${response.status}）`);
+  let diskClosed = false;
+  const fetchResource = async (resource, index) => {
+    let response;
+    let lastStatus = 0;
+    for (const resourceUrl of resource.urls) {
+      try {
+        response = await fetchWithTimeout(resourceUrl, {
+          credentials: "include",
+          cache: "no-store",
+          headers: resource.range
+            ? {
+                Range: `bytes=${resource.range.start}-${resource.range.start + resource.range.length - 1}`,
+              }
+            : undefined,
+        }, 30000, signal);
+        lastStatus = response.status;
+        if (response.ok) break;
+      } catch (error) {
+        response = null;
+        if (signal?.aborted) throw error;
+      }
+    }
+    if (!response?.ok) {
+      const pageBytes = await fetchHlsResourceViaTab(
+        sourceTabId,
+        resource.urls,
+        resource.range,
+        signal,
+      );
+      if (pageBytes?.length) return pageBytes;
+      throw new Error(`HLS 分片 ${index + 1} 读取失败（${lastStatus}）`);
     }
     let bytes = new Uint8Array(await response.arrayBuffer());
     if (resource.range && response.status === 200 && bytes.length > resource.range.length) {
@@ -514,21 +623,60 @@ async function fetchHlsVideo(url, onProgress = () => {}, signal) {
         resource.range.start + resource.range.length,
       );
     }
-    totalLength += bytes.length;
-    if (totalLength > 500 * 1024 * 1024) {
-      throw new Error("单个 HLS 视频超过 500 MB，已停止处理。");
-    }
-    chunks.push(bytes);
-  }
-
-  const firstMediaPath = new URL(resources[hasInitSegment ? 1 : 0]?.url || resources[0].url)
-    .pathname;
-  const extension =
-    hasInitSegment || /\.(?:m4s|mp4)$/i.test(firstMediaPath) ? "mp4" : "ts";
-  return {
-    bytes: concatenateBytes(chunks, totalLength),
-    extension,
+    return bytes;
   };
+  try {
+    const parallelism = 4;
+    for (let start = 0; start < resources.length; start += parallelism) {
+      const batch = await Promise.all(
+        resources
+          .slice(start, start + parallelism)
+          .map((resource, offset) => fetchResource(resource, start + offset)),
+      );
+      for (let offset = 0; offset < batch.length; offset += 1) {
+        const bytes = batch[offset];
+        totalLength += bytes.length;
+        if (diskTarget) await diskTarget.writable.write(bytes);
+        else chunks[start + offset] = bytes;
+      }
+      const sizeLimit = diskTarget ? 4 * 1024 * 1024 * 1024 : 500 * 1024 * 1024;
+      if (totalLength > sizeLimit) {
+        throw new Error(
+          diskTarget
+            ? "单个 HLS 视频超过 4 GB，已停止处理。"
+            : "单个 HLS 视频超过 500 MB，当前浏览器不支持磁盘流式处理。",
+        );
+      }
+      onProgress(
+        Math.max(0, Math.min(resources.length, start + batch.length) - 1),
+        resources.length,
+      );
+    }
+    if (diskTarget) {
+      await diskTarget.writable.close();
+      diskClosed = true;
+      const storedFile = await diskTarget.handle.getFile();
+      return {
+        file: storedFile.slice(
+          0,
+          storedFile.size,
+          extension === "mp4" ? "video/mp4" : "video/mp2t",
+        ),
+        extension,
+        removeTempFile: diskTarget.removeTempFile,
+      };
+    }
+    return {
+      bytes: concatenateBytes(chunks, totalLength),
+      extension,
+    };
+  } catch (error) {
+    if (diskTarget && !diskClosed) {
+      await diskTarget.writable.abort().catch(() => {});
+    }
+    await diskTarget?.removeTempFile();
+    throw error;
+  }
 }
 
 function replaceExtension(filename, extension) {
@@ -1268,43 +1416,91 @@ async function runHlsDownloadJob(message) {
         let candidateError;
         const candidates = [...new Set([...(item.urls || []), item.url].filter(Boolean))];
         for (const candidate of candidates) {
-          try {
-            hls = await fetchHlsVideo(candidate, (segment, total) => {
-              chrome.runtime
-                .sendMessage({
-                  type: "DINGGE_HLS_PROGRESS",
-                  target: "background",
-                  jobId: message.jobId,
-                  percent: Math.round(
-                    ((position + segment / total) / message.items.length) * 95,
-                  ),
-                  text: `正在合并第 ${position + 1}/${message.items.length} 个视频：${segment + 1}/${total} 分片`,
-                })
-                .catch(() => {});
-            }, activeAbortController.signal);
-            break;
-          } catch (error) {
-            candidateError = error;
-            if (activeAbortController.signal.aborted) throw error;
+          for (let attempt = 0; attempt < 3; attempt += 1) {
+            try {
+              const refreshedPlaylist =
+                attempt > 0
+                  ? await fetchHlsPlaylistViaTab(
+                      Number(item.tabId || 0),
+                      candidate,
+                      activeAbortController.signal,
+                    )
+                  : null;
+              hls = await fetchHlsVideo(
+                candidate,
+                (segment, total) => {
+                  chrome.runtime
+                    .sendMessage({
+                      type: "DINGGE_HLS_PROGRESS",
+                      target: "background",
+                      jobId: message.jobId,
+                      percent: Math.round(
+                        ((position + segment / total) / message.items.length) * 95,
+                      ),
+                      text: `正在合并第 ${position + 1}/${message.items.length} 个视频：${segment + 1}/${total} 分片`,
+                    })
+                    .catch(() => {});
+                },
+                activeAbortController.signal,
+                refreshedPlaylist ||
+                  (attempt === 0 && item.prefetchedPlaylist?.sourceUrl === candidate
+                    ? item.prefetchedPlaylist
+                    : null),
+                Number(item.tabId || 0),
+                message.jobId,
+              );
+              break;
+            } catch (error) {
+              candidateError = error;
+              if (activeAbortController.signal.aborted) throw error;
+              const retryable = /HLS 分片 \d+ 读取失败（(?:404|412)）/.test(
+                String(error?.message || ""),
+              );
+              if (!retryable || attempt >= 2) break;
+              chrome.runtime.sendMessage({
+                type: "DINGGE_HLS_PROGRESS",
+                target: "background",
+                jobId: message.jobId,
+                percent: Math.max(3, attempt * 2 + 3),
+                text: `分片地址已失效，正在刷新播放列表并重试 ${attempt + 1}/2…`,
+              }).catch(() => {});
+              await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
+            }
           }
+          if (hls) break;
         }
         if (!hls) throw candidateError || new Error("HLS 播放列表均无法读取。");
-        const blob = new Blob([hls.bytes], {
+        const blob = hls.file || new Blob([hls.bytes], {
           type: hls.extension === "mp4" ? "video/mp4" : "video/mp2t",
         });
         const objectUrl = URL.createObjectURL(blob);
-        setTimeout(() => URL.revokeObjectURL(objectUrl), 120000);
-        const downloadResponse = await chrome.runtime.sendMessage({
-          type: "DINGGE_HLS_MEDIA_READY",
-          target: "background",
-          jobId: message.jobId,
-          objectUrl,
-          filename: replaceExtension(item.name, hls.extension),
-        });
-        if (!downloadResponse?.downloaded) {
-          throw new Error(
-            downloadResponse?.error || "Chrome 无法创建合并后的视频下载。",
-          );
+        let downloadStarted = false;
+        try {
+          const downloadResponse = await chrome.runtime.sendMessage({
+            type: "DINGGE_HLS_MEDIA_READY",
+            target: "background",
+            jobId: message.jobId,
+            objectUrl,
+            filename: replaceExtension(item.name, hls.extension),
+          });
+          if (!downloadResponse?.downloaded) {
+            throw new Error(
+              downloadResponse?.error || "Chrome 无法创建合并后的视频下载。",
+            );
+          }
+          downloadStarted = true;
+        } finally {
+          if (hls.removeTempFile && downloadStarted) {
+            setTimeout(() => {
+              URL.revokeObjectURL(objectUrl);
+              hls.removeTempFile().catch(() => {});
+            }, BILIBILI_ARCHIVE_CLEANUP_DELAY);
+          } else if (downloadStarted) {
+            setTimeout(() => URL.revokeObjectURL(objectUrl), 120000);
+          } else {
+            URL.revokeObjectURL(objectUrl);
+            await hls.removeTempFile?.();
+          }
         }
         successCount += 1;
       } catch (error) {

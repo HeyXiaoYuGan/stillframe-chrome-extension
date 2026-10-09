@@ -54,7 +54,7 @@ header {
 .header-actions {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 5px;
 }
 
 .header-actions button {
@@ -70,9 +70,9 @@ header {
 }
 
 .header-actions #openOptionsButton {
-  width: 64px;
-  min-width: 64px;
-  max-width: 64px;
+  width: 56px;
+  min-width: 56px;
+  max-width: 56px;
   height: 28px;
   padding: 0;
   flex: 0 0 64px;
@@ -85,12 +85,31 @@ header {
   white-space: nowrap;
 }
 
+.header-actions .pin-window-button {
+  width: 28px;
+  min-width: 28px;
+  max-width: 28px;
+  padding: 0;
+  display: inline-grid;
+  place-items: center;
+}
+
+.pin-window-button svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .language-select {
-  width: 72px;
-  min-width: 72px;
+  width: 68px;
+  min-width: 68px;
   height: 28px;
-  max-width: 72px;
-  flex: 0 0 72px;
+  max-width: 68px;
+  flex: 0 0 68px;
   padding: 0 7px;
   border: 1px solid var(--line);
   border-radius: 999px;
@@ -1979,6 +1998,24 @@ html.persistent-window body {
 html.persistent-window .app {
   width: 100%;
   height: 100vh;
+}
+
+html.persistent-window .progress {
+  top: auto;
+  bottom: 32px;
+  box-shadow: 0 -5px 18px rgba(19, 38, 31, 0.12);
+}
+
+html.persistent-window .message {
+  bottom: 136px;
+}
+
+html.persistent-window .app:has(> .progress:not([hidden])) .feature-panel {
+  padding-bottom: 94px;
+}
+
+html.persistent-window .pin-window-button {
+  display: none;
 }
 
 html.persistent-window .image-grid {
