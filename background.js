@@ -11,15 +11,12 @@ const secretCaptureUntilByTab = new Map();
 const secretVideosByTab = new Map();
 const secretVideosLoadingByTab = new Map();
 const secretVideoCacheQueuesByTab = new Map();
-const secretScanTasksByTab = new Map();
-const secretScanStatesByTab = new Map();
 const canceledJobIds = new Set();
 const jobStatusTabIds = new Set();
 const forcedFilenameByUrl = new Map();
 let activeJobCache;
 const BILIBILI_HEADER_RULE_ID = 9767001;
 const DOUYIN_HEADER_RULE_ID = 9767003;
-const PORNHUB_HEADER_RULE_ID = 9767004;
 let liveScanEnabled = false;
 let liveScanSettingLoaded = false;
 
@@ -40,12 +37,7 @@ async function ensureSiteDownloadHeaders() {
   if (!chrome.declarativeNetRequest?.updateDynamicRules) return;
   await chrome.declarativeNetRequest.updateDynamicRules({
     // 9767002 removes a legacy dynamic rule created by an earlier release.
-    removeRuleIds: [
-      BILIBILI_HEADER_RULE_ID,
-      DOUYIN_HEADER_RULE_ID,
-      PORNHUB_HEADER_RULE_ID,
-      9767002,
-    ],
+    removeRuleIds: [BILIBILI_HEADER_RULE_ID, DOUYIN_HEADER_RULE_ID, 9767002],
     addRules: [
       {
         id: BILIBILI_HEADER_RULE_ID,
@@ -77,29 +69,6 @@ async function ensureSiteDownloadHeaders() {
         condition: {
           regexFilter:
             "^https?://([^/]+\\.)?(douyinvod\\.com|douyinstatic\\.com|douyinpic\\.com|bytecdn\\.(cn|com)|byteimg\\.com|bytedance\\.com|bytevcloud\\.com|ibytedtos\\.com|pstatp\\.com|zjcdn\\.com|byted\\.org)/",
-          resourceTypes: ["media", "other", "xmlhttprequest"],
-        },
-      },
-      {
-        id: PORNHUB_HEADER_RULE_ID,
-        priority: 1,
-        action: {
-          type: "modifyHeaders",
-          requestHeaders: [
-            {
-              header: "Referer",
-              operation: "set",
-              value: "https://www.pornhub.com/",
-            },
-            {
-              header: "Origin",
-              operation: "set",
-              value: "https://www.pornhub.com",
-            },
-          ],
-        },
-        condition: {
-          regexFilter: "^https?://([^/]+\\.)?phncdn\\.com/",
           resourceTypes: ["media", "other", "xmlhttprequest"],
         },
       },
@@ -206,10 +175,6 @@ function secretVideosStorageKey(tabId) {
   return `secretVideos:${tabId}`;
 }
 
-function secretScanStorageKey(tabId) {
-  return `secretScan:${tabId}`;
-}
-
 function queueSecretVideoCacheOperation(tabId, operation) {
   const previous = secretVideoCacheQueuesByTab.get(tabId) || Promise.resolve();
   const queued = previous.catch(() => {}).then(operation);
@@ -255,27 +220,6 @@ function clearCachedSecretVideos(tabId) {
     secretVideosLoadingByTab.delete(tabId);
     await chrome.storage.session.remove(secretVideosStorageKey(tabId));
   });
-}
-
-async function getSecretScanState(tabId) {
-  if (secretScanStatesByTab.has(tabId)) return secretScanStatesByTab.get(tabId);
-  const key = secretScanStorageKey(tabId);
-  const stored = await chrome.storage.session.get(key);
-  const state = stored[key] || null;
-  if (state) secretScanStatesByTab.set(tabId, state);
-  return state;
-}
-
-async function setSecretScanState(tabId, state) {
-  secretScanStatesByTab.set(tabId, state);
-  await chrome.storage.session.set({ [secretScanStorageKey(tabId)]: state });
-  return state;
-}
-
-async function clearSecretScanState(tabId) {
-  secretScanTasksByTab.delete(tabId);
-  secretScanStatesByTab.delete(tabId);
-  await chrome.storage.session.remove(secretScanStorageKey(tabId));
 }
 
 function hasActiveSecretCapture(tabId) {
@@ -479,7 +423,6 @@ chrome.webRequest.onBeforeRequest.addListener(
     if (details.type === "main_frame") {
       contextMediaByTab.delete(details.tabId);
       secretCaptureUntilByTab.delete(details.tabId);
-      clearSecretScanState(details.tabId).catch(() => {});
       clearNetworkMedia(details.tabId).catch(() => {});
       clearCachedSecretVideos(details.tabId).catch(() => {});
       return;
@@ -535,7 +478,6 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   contextMediaByTab.delete(tabId);
   bilibiliDashByTab.delete(tabId);
   secretCaptureUntilByTab.delete(tabId);
-  clearSecretScanState(tabId).catch(() => {});
   chrome.storage.session.remove(networkStorageKey(tabId)).catch(() => {});
   clearCachedSecretVideos(tabId).catch(() => {});
 });
@@ -1391,33 +1333,6 @@ function secretCandidateQuality(candidate = {}) {
   return 0;
 }
 
-function selectSecretHlsFallback(candidates = [], preferredQuality = 0) {
-  return candidates
-    .filter((candidate) => secretCandidateFormat(candidate) === "hls")
-    .sort((left, right) => {
-      const leftQuality = secretCandidateQuality(left);
-      const rightQuality = secretCandidateQuality(right);
-      if (preferredQuality) {
-        const distance =
-          Math.abs(leftQuality - preferredQuality) -
-          Math.abs(rightQuality - preferredQuality);
-        if (distance) return distance;
-      }
-      return rightQuality - leftQuality;
-    })[0] || null;
-}
-
-function secretDownloadFilename(basename, candidate = {}, extension = "") {
-  const format = secretCandidateFormat(candidate) || "video";
-  const quality = secretCandidateQuality(candidate);
-  const suffix = [
-    quality ? `${quality}P` : "",
-    format.toUpperCase(),
-  ].filter(Boolean).join("-");
-  const resolvedExtension = extension || (format === "webm" ? "webm" : "mp4");
-  return `${basename}-${suffix}.${resolvedExtension}`;
-}
-
 function secretMediaResourceKey(rawUrl) {
   const value = String(rawUrl || "").trim();
   if (!value) return "";
@@ -1534,8 +1449,6 @@ function normalizeSecretVideo(rawVideo, networkItems = [], siteKind = "") {
       format,
       streamType: format === "hls" ? "hls" : "",
       selectable: true,
-      verified: rawCandidate?.verified === true,
-      probeRestricted: rawCandidate?.probeRestricted === true,
       label:
         String(rawCandidate?.label || "").trim() ||
         (quality ? `${quality}P · ${format.toUpperCase()}` : format.toUpperCase()),
@@ -1625,22 +1538,12 @@ function cacheSecretVideoUpdates(tabId, rawVideos, siteKind, pageUrl = "") {
 async function executeSecretExtractorInTab(tabId, siteKind) {
   const file = siteKind === "onlyfans" ? "onlyfans-main.js" : "pornhub-main.js";
   if (siteKind === "pornhub") {
-    let timeoutId;
-    const extraction = chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
-      files: [file],
-    });
     return {
-      results: await Promise.race([
-        extraction,
-        new Promise((_, reject) => {
-          timeoutId = setTimeout(
-            () => reject(new Error("页面播放器解析超过 6 秒，已切换备用识别方式。")),
-            6_000,
-          );
-        }),
-      ]).finally(() => clearTimeout(timeoutId)),
+      results: await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        files: [file],
+      }),
       usedTopFrameFallback: false,
     };
   }
@@ -1669,178 +1572,11 @@ async function executeSecretExtractorInTab(tabId, siteKind) {
   }
 }
 
-async function validateSecretVideoCandidatesInPage(rawVideos) {
-  const videos = Array.isArray(rawVideos) ? rawVideos : [];
-  const withTimeout = async (operation, timeoutMs = 4000) => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      return await operation(controller.signal);
-    } finally {
-      clearTimeout(timer);
-    }
-  };
-  const resolveInheritedUrl = (value, baseUrl) => {
-    const base = new URL(baseUrl);
-    const resolved = new URL(String(value || "").trim(), base);
-    if (resolved.origin === base.origin && base.search) {
-      for (const [key, parameterValue] of base.searchParams) {
-        if (!resolved.searchParams.has(key)) {
-          resolved.searchParams.append(key, parameterValue);
-        }
-      }
-    }
-    return resolved.href;
-  };
-  const resourceCandidates = (value, baseUrl) => [
-    ...new Set([
-      new URL(String(value || "").trim(), baseUrl).href,
-      resolveInheritedUrl(value, baseUrl),
-    ]),
-  ];
-  const firstReadableChunk = async (url, headers = undefined) => {
-    try {
-      return await withTimeout(async (signal) => {
-        const response = await fetch(url, {
-          credentials: "include",
-          cache: "no-store",
-          headers,
-          signal,
-        });
-        if (!response.ok) return false;
-        const mime = String(response.headers.get("content-type") || "").toLowerCase();
-        if (mime.startsWith("text/") || mime.includes("html") || mime.includes("json")) {
-          return false;
-        }
-        const reader = response.body?.getReader();
-        if (!reader) return mime.startsWith("video/") || mime.startsWith("audio/");
-        const first = await reader.read();
-        await reader.cancel().catch(() => {});
-        return Boolean(first.value?.byteLength);
-      });
-    } catch {
-      return false;
-    }
-  };
-  const probeHls = async (sourceUrl) => {
-    let currentUrls = [sourceUrl];
-    for (let depth = 0; depth <= 4; depth += 1) {
-      let playlist = null;
-      for (const currentUrl of currentUrls) {
-        try {
-          playlist = await withTimeout(async (signal) => {
-            const response = await fetch(currentUrl, {
-              credentials: "include",
-              cache: "no-store",
-              headers: {
-                Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
-              },
-              signal,
-            });
-            if (!response.ok) return null;
-            const text = await response.text();
-            return text.trimStart().startsWith("#EXTM3U")
-              ? { url: response.url || currentUrl, lines: text.split(/\r?\n/).map((line) => line.trim()) }
-              : null;
-          });
-        } catch {
-          playlist = null;
-        }
-        if (playlist) break;
-      }
-      if (!playlist) return false;
-      if (playlist.lines.some(
-        (line) => line.startsWith("#EXT-X-KEY:") && !/METHOD=NONE(?:,|$)/i.test(line),
-      )) return false;
-      const variants = [];
-      for (let index = 0; index < playlist.lines.length; index += 1) {
-        if (!playlist.lines[index].startsWith("#EXT-X-STREAM-INF:")) continue;
-        const nextLine = playlist.lines
-          .slice(index + 1)
-          .find((line) => line && !line.startsWith("#"));
-        if (!nextLine) continue;
-        variants.push({
-          urls: resourceCandidates(nextLine, playlist.url),
-          bandwidth: Number(
-            playlist.lines[index].match(/\bBANDWIDTH=(\d+)/i)?.[1] || 0,
-          ),
-        });
-      }
-      if (variants.length) {
-        variants.sort((left, right) => right.bandwidth - left.bandwidth);
-        currentUrls = variants[0].urls;
-        continue;
-      }
-      const mapLine = playlist.lines.find((line) => line.startsWith("#EXT-X-MAP:"));
-      const mapUri = mapLine?.match(/\bURI="([^"]+)"/i)?.[1] || "";
-      const mediaLine = playlist.lines.find((line) => line && !line.startsWith("#"));
-      const firstResource = mapUri || mediaLine;
-      if (!firstResource) return false;
-      for (const resourceUrl of resourceCandidates(firstResource, playlist.url)) {
-        if (await firstReadableChunk(resourceUrl)) return true;
-      }
-      return false;
-    }
-    return false;
-  };
-  const validateCandidate = async (candidate) => {
-    const urls = [...new Set([
-      candidate?.url,
-      ...(Array.isArray(candidate?.fallbackUrls) ? candidate.fallbackUrls : []),
-    ].filter((url) => /^https?:\/\//i.test(String(url || ""))))];
-    const isHls = /m3u8|\bhls\b/i.test(
-      `${candidate?.format || ""} ${candidate?.streamType || ""} ${candidate?.url || ""}`,
-    );
-    for (const url of urls) {
-      const readable = isHls
-        ? await probeHls(url)
-        : await firstReadableChunk(url, { Range: "bytes=0-31" });
-      if (!readable) continue;
-      return {
-        ...candidate,
-        url,
-        fallbackUrls: [],
-        verified: true,
-      };
-    }
-    return null;
-  };
-  const validatedVideos = [];
-  for (const video of videos) {
-    const candidates = [];
-    const sourceCandidates = video?.candidates || [];
-    for (let index = 0; index < sourceCandidates.length; index += 6) {
-      const batch = await Promise.all(
-        sourceCandidates.slice(index, index + 6).map(validateCandidate),
-      );
-      candidates.push(...batch.filter(Boolean));
-    }
-    if (candidates.length) validatedVideos.push({ ...video, candidates });
-  }
-  return validatedVideos;
-}
-
-async function validateSecretVideoCandidatesInTab(tabId, videos) {
-  try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
-      func: validateSecretVideoCandidatesInPage,
-      args: [videos],
-    });
-    const validated = results?.[0]?.result;
-    return Array.isArray(validated) ? validated : null;
-  } catch {
-    return null;
-  }
-}
-
-async function readSecretVideosFromTab(tab, onProgress = () => {}) {
+async function readSecretVideosFromTab(tab) {
   const siteKind = secretSiteKindFromUrl(tab?.url);
   if (!tab?.id || !siteKind) {
     throw new Error("当前标签页不是受支持的视频页面。");
   }
-  onProgress(10, "正在读取当前页面播放器…");
   secretCaptureUntilByTab.set(tab.id, Date.now() + 30_000);
   let pageVideo = null;
   let rawPageVideos = [];
@@ -1848,15 +1584,6 @@ async function readSecretVideosFromTab(tab, onProgress = () => {}) {
   let extractorResultCount = 0;
   let injectionFailed = false;
   let usedTopFrameFallback = false;
-  onProgress(20, "正在解析页面视频信息…");
-  let extractorSeconds = 0;
-  const extractorHeartbeat = setInterval(() => {
-    extractorSeconds += 1;
-    onProgress(
-      Math.min(35, 20 + extractorSeconds * 3),
-      `正在解析页面视频信息… ${extractorSeconds}/6 秒`,
-    );
-  }, 1000);
   try {
     const extraction = await executeSecretExtractorInTab(tab.id, siteKind);
     const results = extraction.results;
@@ -1894,15 +1621,11 @@ async function readSecretVideosFromTab(tab, onProgress = () => {}) {
   } catch {
     injectionFailed = true;
     // Network media captured from the current tab can still provide a clear stream.
-  } finally {
-    clearInterval(extractorHeartbeat);
   }
-  onProgress(38, "播放器信息读取完成，正在收集媒体地址…");
   if (!pageVideo?.candidates?.length) {
     await new Promise((resolve) => setTimeout(resolve, 1200));
   }
   const networkItems = await collectTabMedia(tab.id).catch(() => []);
-  onProgress(50, "媒体地址收集完成，正在整理清晰度…");
   const capturedVideoItems = networkItems.filter((item) => item?.kind === "video");
   const videos = [];
   const pendingVideos = [];
@@ -1995,236 +1718,16 @@ async function readSecretVideosFromTab(tab, onProgress = () => {}) {
       `${pageVideo?.unsupportedReason || "没有读取到可下载的视频地址，请先播放视频几秒后重试。"}（诊断：${diagnostics}）`,
     );
   }
-  if (siteKind === "pornhub") {
-    onProgress(62, "正在验证可下载的清晰度…");
-    const unverifiedVideos = allVideos;
-    const validatedVideos = await validateSecretVideoCandidatesInTab(
-      tab.id,
-      allVideos,
-    );
-    if (validatedVideos?.length) {
-      allVideos = validatedVideos;
-      await setCachedSecretVideos(tab.id, allVideos).catch(() => {});
-    } else {
-      allVideos = unverifiedVideos.map((video) => ({
-        ...video,
-        candidates: (video.candidates || []).map((candidate) => ({
-          ...candidate,
-          probeRestricted: true,
-        })),
-      }));
-      await setCachedSecretVideos(tab.id, allVideos).catch(() => {});
-    }
-    onProgress(92, "清晰度验证完成…");
-  }
-  if (!allVideos.length) {
-    throw new Error("当前页面没有可读取的视频清晰度，请播放几秒后重新识别。");
-  }
   if (allVideos.some((video) => video?.candidates?.length) && !pendingVideos.length) {
     secretCaptureUntilByTab.delete(tab.id);
   }
   const pendingCount = allVideos.filter(
     (video) => !video?.candidates?.length,
   ).length;
-  const validationLimited = allVideos.some((video) =>
-    video?.candidates?.some((candidate) => candidate?.probeRestricted === true),
-  );
-  const warnings = [];
-  if (validationLimited) {
-    warnings.push("网站限制了清晰度预检，已保留播放器提供的地址，下载时会再次验证。");
-  }
-  if (pendingCount) {
-    warnings.push(`已识别 ${allVideos.length} 个页面视频，其中 ${pendingCount} 个尚未加载媒体地址；播放对应视频后请再次识别。`);
-  }
-  const warning = warnings.join(" ");
+  const warning = pendingCount
+    ? `已识别 ${allVideos.length} 个页面视频，其中 ${pendingCount} 个尚未加载媒体地址；播放对应视频后请再次识别。`
+    : "";
   return { videos: allVideos, warning, diagnostics };
-}
-
-function sameSecretPage(left, right) {
-  try {
-    const first = new URL(String(left || ""));
-    const second = new URL(String(right || ""));
-    first.hash = "";
-    second.hash = "";
-    return first.href === second.href;
-  } catch {
-    return String(left || "") === String(right || "");
-  }
-}
-
-async function beginPersistentSecretScan(tab, force = false) {
-  const tabId = Number(tab?.id || 0);
-  const pageUrl = String(tab?.url || "");
-  if (!tabId || !secretSiteKindFromUrl(pageUrl)) {
-    throw new Error("当前标签页不是受支持的视频页面。");
-  }
-  const existing = secretScanTasksByTab.get(tabId);
-  if (existing?.promise && sameSecretPage(existing.pageUrl, pageUrl)) {
-    return existing;
-  }
-  if (force) await clearCachedSecretVideos(tabId).catch(() => {});
-  const record = {
-    pageUrl,
-    status: "scanning",
-    startedAt: Date.now(),
-    updatedAt: Date.now(),
-    promise: null,
-  };
-  secretScanTasksByTab.set(tabId, record);
-  await setSecretScanState(tabId, {
-    pageUrl,
-    status: "scanning",
-    startedAt: record.startedAt,
-    updatedAt: record.updatedAt,
-    percent: 5,
-    text: "正在准备识别当前页面…",
-  });
-  chrome.runtime.sendMessage({
-    type: "DINGGE_SECRET_SCAN_STATUS",
-    target: "popup",
-    tabId,
-    pageUrl,
-    status: "scanning",
-    percent: 5,
-    text: "正在准备识别当前页面…",
-  }).catch(() => {});
-  const publishProgress = (percent, text) => {
-    if (secretScanTasksByTab.get(tabId) !== record) return;
-    record.updatedAt = Date.now();
-    setSecretScanState(tabId, {
-      pageUrl,
-      status: "scanning",
-      startedAt: record.startedAt,
-      updatedAt: record.updatedAt,
-      percent,
-      text,
-    }).catch(() => {});
-    chrome.runtime.sendMessage({
-      type: "DINGGE_SECRET_SCAN_STATUS",
-      target: "popup",
-      tabId,
-      pageUrl,
-      status: "scanning",
-      percent,
-      text,
-    }).catch(() => {});
-  };
-  let timeoutId;
-  const scan = readSecretVideosFromTab(tab, publishProgress);
-  const deadline = new Promise((_, reject) => {
-    timeoutId = setTimeout(
-      () => reject(new Error("页面识别超过 60 秒，请播放视频后重试。")),
-      60_000,
-    );
-  });
-  record.promise = Promise.race([scan, deadline])
-    .then(async (result) => {
-      const currentRecord = secretScanTasksByTab.get(tabId);
-      const currentTab = await chrome.tabs.get(tabId).catch(() => null);
-      if (
-        currentRecord !== record ||
-        !currentTab ||
-        !sameSecretPage(currentTab.url, pageUrl)
-      ) {
-        await clearCachedSecretVideos(tabId).catch(() => {});
-        return null;
-      }
-      record.status = "complete";
-      record.updatedAt = Date.now();
-      await setSecretScanState(tabId, {
-        pageUrl,
-        status: "complete",
-        startedAt: record.startedAt,
-        updatedAt: record.updatedAt,
-      });
-      chrome.runtime.sendMessage({
-        type: "DINGGE_SECRET_SCAN_STATUS",
-        target: "popup",
-        tabId,
-        pageUrl,
-        status: "complete",
-        ...result,
-      }).catch(() => {});
-      return result;
-    })
-    .catch(async (error) => {
-      if (secretScanTasksByTab.get(tabId) !== record) return null;
-      record.status = "error";
-      record.updatedAt = Date.now();
-      record.error = error?.message || "当前页面视频识别失败。";
-      await setSecretScanState(tabId, {
-        pageUrl,
-        status: "error",
-        error: record.error,
-        startedAt: record.startedAt,
-        updatedAt: record.updatedAt,
-      });
-      chrome.runtime.sendMessage({
-        type: "DINGGE_SECRET_SCAN_STATUS",
-        target: "popup",
-        tabId,
-        pageUrl,
-        status: "error",
-        error: record.error,
-      }).catch(() => {});
-      return null;
-    })
-    .finally(() => {
-      clearTimeout(timeoutId);
-      if (secretScanTasksByTab.get(tabId) === record) record.promise = null;
-    });
-  return record;
-}
-
-async function secretScanStatusForTab(tab) {
-  const tabId = Number(tab?.id || 0);
-  const pageUrl = String(tab?.url || "");
-  if (!tabId || !secretSiteKindFromUrl(pageUrl)) return { requested: false };
-  let state = await getSecretScanState(tabId);
-  if (!state || !sameSecretPage(state.pageUrl, pageUrl)) {
-    if (state) await clearSecretScanState(tabId);
-    return { requested: false };
-  }
-  const activeTask = secretScanTasksByTab.get(tabId)?.promise || null;
-  const cachedVideos = await getCachedSecretVideos(tabId).catch(() => []);
-  if (cachedVideos.some((video) => video?.candidates?.length)) {
-    if (!activeTask && state.status !== "complete") {
-      state = await setSecretScanState(tabId, {
-        ...state,
-        status: "complete",
-        percent: 100,
-        text: "视频识别完成",
-        updatedAt: Date.now(),
-      });
-    }
-    return {
-      requested: true,
-      active: Boolean(activeTask),
-      status: activeTask ? "scanning" : "complete",
-      error: "",
-      percent: activeTask ? Number(state.percent) || 38 : 100,
-      text: activeTask
-        ? String(state.text || "正在验证剩余清晰度…")
-        : "视频识别完成",
-      videos: cachedVideos,
-    };
-  }
-  if (state.status === "scanning" && !activeTask) {
-    await beginPersistentSecretScan(tab, false);
-    state = await getSecretScanState(tabId);
-  }
-  const videos = state.status === "complete"
-    ? await getCachedSecretVideos(tabId).catch(() => [])
-    : [];
-  return {
-    requested: true,
-    active: state.status === "scanning",
-    status: state.status,
-    error: state.error || "",
-    percent: Number(state.percent) || 0,
-    text: String(state.text || ""),
-    videos,
-  };
 }
 
 async function readSecretVideoFromTab(tab) {
@@ -2464,672 +1967,60 @@ async function downloadDouyinVideo(
   };
 }
 
-async function fetchHlsPlaylistFromTab(tabId, rawUrl) {
-  if (!tabId || !/^https?:\/\//i.test(String(rawUrl || ""))) return null;
-  try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
-      func: async (sourceUrl) => {
-        const resolveResourceUrl = (value, baseUrl) => {
-          const base = new URL(baseUrl);
-          const resolved = new URL(String(value || "").trim(), base);
-          if (resolved.origin === base.origin && base.search) {
-            for (const [key, parameterValue] of base.searchParams) {
-              if (!resolved.searchParams.has(key)) {
-                resolved.searchParams.append(key, parameterValue);
-              }
-            }
-          }
-          return resolved.href;
-        };
-        const resourceUrlCandidates = (value, baseUrl) => {
-          const standardUrl = new URL(String(value || "").trim(), baseUrl).href;
-          const inheritedUrl = resolveResourceUrl(value, baseUrl);
-          return [...new Set([standardUrl, inheritedUrl])];
-        };
-        let currentUrls = [sourceUrl];
-        for (let depth = 0; depth <= 4; depth += 1) {
-          let response;
-          let lastStatus = 0;
-          for (const currentUrl of currentUrls) {
-            try {
-              response = await fetch(currentUrl, {
-                credentials: "include",
-                cache: "no-store",
-                headers: {
-                  Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
-                },
-              });
-              lastStatus = response.status;
-              if (response.ok) break;
-            } catch {
-              response = null;
-            }
-          }
-          if (!response?.ok) return { ok: false, status: lastStatus };
-          const text = await response.text();
-          if (!text.trimStart().startsWith("#EXTM3U") || text.length > 2_000_000) {
-            return { ok: false, status: 0 };
-          }
-          const playlistUrl = response.url || currentUrl;
-          const lines = text.split(/\r?\n/).map((line) => line.trim());
-          const variants = [];
-          for (let index = 0; index < lines.length; index += 1) {
-            if (!lines[index].startsWith("#EXT-X-STREAM-INF:")) continue;
-            const bandwidth = Number(
-              lines[index].match(/\bBANDWIDTH=(\d+)/i)?.[1] || 0,
-            );
-            const nextLine = lines
-              .slice(index + 1)
-              .find((line) => line && !line.startsWith("#"));
-            if (!nextLine) continue;
-            variants.push({
-              urls: resourceUrlCandidates(nextLine, playlistUrl),
-              bandwidth,
-            });
-          }
-          if (!variants.length) {
-            return { ok: true, sourceUrl, url: playlistUrl, text };
-          }
-          variants.sort((left, right) => right.bandwidth - left.bandwidth);
-          currentUrls = variants[0].urls;
-        }
-        return { ok: false, status: 0 };
-      },
-      args: [String(rawUrl)],
-    });
-    const playlist = results?.[0]?.result;
-    return playlist?.ok && playlist.text ? playlist : null;
-  } catch {
-    return null;
-  }
-}
-
-async function fetchHlsResourceFromTab(tabId, rawUrls, range = null) {
-  if (!tabId) return { ok: false, status: 0 };
-  const urls = [...new Set((Array.isArray(rawUrls) ? rawUrls : [])
-    .map((url) => String(url || ""))
-    .filter((url) => /^https?:\/\//i.test(url)))]
-    .slice(0, 3);
-  if (!urls.length) return { ok: false, status: 0 };
-  try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
-      func: async (candidateUrls, requestedRange) => {
-        let lastStatus = 0;
-        for (const url of candidateUrls) {
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 15000);
-          try {
-            const headers = requestedRange
-              ? {
-                  Range: `bytes=${requestedRange.start}-${requestedRange.start + requestedRange.length - 1}`,
-                }
-              : undefined;
-            const response = await fetch(url, {
-              credentials: "include",
-              cache: "no-store",
-              headers,
-              signal: controller.signal,
-            });
-            lastStatus = response.status;
-            if (!response.ok) continue;
-            const mime = String(response.headers.get("content-type") || "").toLowerCase();
-            if (mime.startsWith("text/") || mime.includes("html") || mime.includes("json")) {
-              continue;
-            }
-            let bytes = new Uint8Array(await response.arrayBuffer());
-            if (
-              requestedRange &&
-              response.status === 200 &&
-              bytes.length > requestedRange.length
-            ) {
-              bytes = bytes.slice(
-                requestedRange.start,
-                requestedRange.start + requestedRange.length,
-              );
-            }
-            if (!bytes.length || bytes.length > 24 * 1024 * 1024) continue;
-            let binary = "";
-            for (let offset = 0; offset < bytes.length; offset += 0x8000) {
-              binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
-            }
-            return { ok: true, status: response.status, base64: btoa(binary) };
-          } catch {
-            // Try another URL resolved from the same playlist entry.
-          } finally {
-            clearTimeout(timer);
-          }
-        }
-        return { ok: false, status: lastStatus };
-      },
-      args: [urls, range],
-    });
-    return results?.[0]?.result || { ok: false, status: 0 };
-  } catch {
-    return { ok: false, status: 0 };
-  }
-}
-
-async function downloadSecretMediaInsidePage(
-  rawUrls,
-  requestedFormat,
-  filename,
-  mediabunnyModuleUrl = "",
-  jobId = "",
-) {
-  const urls = [...new Set((Array.isArray(rawUrls) ? rawUrls : []).filter(
-    (url) => /^https?:\/\//i.test(String(url || "")),
-  ))];
-  const reportProgress = (percent, text) => {
-    if (!jobId) return;
-    window.postMessage({
-      source: "stillframe-page-media",
-      type: "progress",
-      jobId,
-      percent: Math.max(0, Math.min(100, Math.round(Number(percent) || 0))),
-      text: String(text || "正在读取当前页面视频…"),
-    }, "*");
-  };
-  const resolveResourceUrl = (value, baseUrl) => {
-    const base = new URL(baseUrl);
-    const resolved = new URL(String(value || "").trim(), base);
-    if (resolved.origin === base.origin && base.search) {
-      for (const [key, parameterValue] of base.searchParams) {
-        if (!resolved.searchParams.has(key)) {
-          resolved.searchParams.append(key, parameterValue);
-        }
-      }
-    }
-    return resolved.href;
-  };
-  const resourceUrlCandidates = (value, baseUrl) => {
-    const standardUrl = new URL(String(value || "").trim(), baseUrl).href;
-    const inheritedUrl = resolveResourceUrl(value, baseUrl);
-    return [...new Set([standardUrl, inheritedUrl])];
-  };
-  const parseAttributes = (line) => {
-    const attributes = {};
-    const body = line.slice(line.indexOf(":") + 1);
-    for (const match of body.matchAll(/([A-Z0-9-]+)=("[^"]*"|[^,]*)/gi)) {
-      attributes[match[1].toUpperCase()] = match[2].replace(/^"|"$/g, "");
-    }
-    return attributes;
-  };
-  const request = (url, options = {}) =>
-    fetch(url, {
-      credentials: "include",
-      cache: "no-store",
-      ...options,
-    });
-  const startBlobDownload = (blob, outputName) => {
-    const objectUrl = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = objectUrl;
-    anchor.download = outputName;
-    anchor.style.display = "none";
-    (document.body || document.documentElement).append(anchor);
-    anchor.click();
-    anchor.remove();
-    setTimeout(() => URL.revokeObjectURL(objectUrl), 5 * 60 * 1000);
-  };
-  const downloadDirect = async () => {
-    let lastStatus = 0;
-    reportProgress(8, "正在读取当前页面视频…");
-    for (const url of urls) {
-      try {
-        const response = await request(url);
-        lastStatus = response.status;
-        if (!response.ok) continue;
-        const mime = String(response.headers.get("content-type") || "").toLowerCase();
-        if (mime.startsWith("text/") || mime.includes("html") || mime.includes("json")) {
-          continue;
-        }
-        const blob = await response.blob();
-        const header = new Uint8Array(await blob.slice(0, 24).arrayBuffer());
-        const ascii = String.fromCharCode(...header);
-        const valid =
-          mime.startsWith("video/") ||
-          mime.startsWith("audio/") ||
-          ascii.slice(4, 8) === "ftyp" ||
-          (header[0] === 0x1a && header[1] === 0x45 && header[2] === 0xdf && header[3] === 0xa3);
-        if (!valid) continue;
-        reportProgress(96, "视频读取完成，正在创建下载…");
-        startBlobDownload(blob, filename);
-        reportProgress(100, "视频已开始下载");
-        return { started: true, size: blob.size, extension: requestedFormat };
-      } catch {
-        // Try the next current-page media URL.
-      }
-    }
-    return { started: false, status: lastStatus };
-  };
-  const readMediaPlaylist = async (sourceUrl) => {
-    let currentUrls = [sourceUrl];
-    for (let depth = 0; depth <= 4; depth += 1) {
-      reportProgress(6 + depth * 2, "正在读取 m3u8 播放列表…");
-      let response;
-      let lastStatus = 0;
-      for (const currentUrl of currentUrls) {
-        try {
-          response = await request(currentUrl, {
-            headers: {
-              Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
-            },
-          });
-          lastStatus = response.status;
-          if (response.ok) break;
-        } catch {
-          response = null;
-        }
-      }
-      if (!response?.ok) throw new Error(`HLS 播放列表读取失败（${lastStatus}）`);
-      const text = await response.text();
-      if (!text.trimStart().startsWith("#EXTM3U")) {
-        throw new Error("资源不是有效的 m3u8 播放列表。");
-      }
-      const playlistUrl = response.url || currentUrl;
-      const lines = text.split(/\r?\n/).map((line) => line.trim());
-      const variants = [];
-      for (let index = 0; index < lines.length; index += 1) {
-        if (!lines[index].startsWith("#EXT-X-STREAM-INF:")) continue;
-        const attributes = parseAttributes(lines[index]);
-        const nextLine = lines
-          .slice(index + 1)
-          .find((line) => line && !line.startsWith("#"));
-        if (!nextLine) continue;
-        variants.push({
-          urls: resourceUrlCandidates(nextLine, playlistUrl),
-          bandwidth: Number(attributes.BANDWIDTH) || 0,
-        });
-      }
-      if (!variants.length) return { url: playlistUrl, lines };
-      variants.sort((left, right) => right.bandwidth - left.bandwidth);
-      currentUrls = variants[0].urls;
-    }
-    throw new Error("HLS 主播放列表嵌套过深。");
-  };
-  const downloadHlsWithMediabunny = async (sourceUrl, outputName) => {
-    if (!mediabunnyModuleUrl) return null;
-    const media = await import(mediabunnyModuleUrl);
-    const target = new media.BufferTarget();
-    const input = new media.Input({
-      source: new media.UrlSource(sourceUrl, {
-        requestInit: { credentials: "include", cache: "no-store" },
-        parallelism: 4,
-        fetchFn: (inputValue, init = {}) =>
-          fetch(inputValue, {
-            ...init,
-            credentials: "include",
-            cache: "no-store",
-          }),
-      }),
-      formats: [new media.HlsInputFormat()],
-    });
-    const output = new media.Output({
-      format: new media.Mp4OutputFormat(),
-      target,
-    });
-    let conversion;
-    try {
-      conversion = await media.Conversion.init({
-        input,
-        output,
-        video: { forceTranscode: false },
-        audio: { forceTranscode: false },
-        showWarnings: false,
-      });
-      if (!conversion.isValid || !conversion.utilizedTracks.length) return null;
-      conversion.onProgress = (progress) => {
-        reportProgress(12 + Math.round((Number(progress) || 0) * 82), "正在使用 Mediabunny 合并视频…");
-      };
-      await conversion.execute();
-      if (!target.buffer?.byteLength || target.buffer.byteLength > 500 * 1024 * 1024) {
-        return null;
-      }
-      const blob = new Blob([target.buffer], { type: "video/mp4" });
-      reportProgress(96, "视频合并完成，正在创建下载…");
-      startBlobDownload(
-        blob,
-        outputName.replace(/\.[a-zA-Z0-9]{2,5}$/i, ".mp4"),
-      );
-      reportProgress(100, "视频已开始下载");
-      return { started: true, size: blob.size, extension: "mp4", engine: "mediabunny" };
-    } finally {
-      if (conversion?.state !== "done") await conversion?.cancel().catch(() => {});
-      if (output.state !== "finalized") await output.cancel().catch(() => {});
-      input.dispose();
-    }
-  };
-  const downloadHls = async () => {
-    let lastError;
-    for (const url of urls) {
-      try {
-        const playlist = await readMediaPlaylist(url);
-        if (playlist.lines.some(
-          (line) => line.startsWith("#EXT-X-KEY:") && !/METHOD=NONE(?:,|$)/i.test(line),
-        )) {
-          throw new Error("检测到受保护的 HLS，未进行解密。");
-        }
-        try {
-          const remuxed = await downloadHlsWithMediabunny(url, filename);
-          if (remuxed?.started) return remuxed;
-        } catch {
-          // Fall back to the built-in ordered segment concatenation below.
-        }
-        const resources = [];
-        let pendingRange = null;
-        let previousRangeEnd = 0;
-        let hasInitSegment = false;
-        for (const line of playlist.lines) {
-          if (line.startsWith("#EXT-X-MAP:")) {
-            const attributes = parseAttributes(line);
-            if (attributes.URI) {
-              const [lengthText, offsetText] = String(attributes.BYTERANGE || "").split("@");
-              const length = Number(lengthText) || 0;
-              resources.push({
-                urls: resourceUrlCandidates(attributes.URI, playlist.url),
-                range: length ? { start: Number(offsetText) || 0, length } : null,
-              });
-              hasInitSegment = true;
-            }
-            continue;
-          }
-          if (line.startsWith("#EXT-X-BYTERANGE:")) {
-            const [lengthText, offsetText] = line.slice(line.indexOf(":") + 1).split("@");
-            const length = Number(lengthText) || 0;
-            pendingRange = length
-              ? {
-                  start: offsetText === undefined ? previousRangeEnd : Number(offsetText) || 0,
-                  length,
-                }
-              : null;
-            continue;
-          }
-          if (!line || line.startsWith("#")) continue;
-          resources.push({
-            urls: resourceUrlCandidates(line, playlist.url),
-            range: pendingRange,
-          });
-          if (pendingRange) {
-            previousRangeEnd = pendingRange.start + pendingRange.length;
-            pendingRange = null;
-          }
-        }
-        if (!resources.length || resources.length > 3000) {
-          throw new Error("HLS 播放列表没有可下载的分片。");
-        }
-        const parts = new Array(resources.length);
-        let totalSize = 0;
-        const fetchPart = async (resource, index) => {
-          let response;
-          let lastStatus = 0;
-          for (const resourceUrl of resource.urls) {
-            try {
-              response = await request(resourceUrl, {
-                headers: resource.range
-                  ? { Range: `bytes=${resource.range.start}-${resource.range.start + resource.range.length - 1}` }
-                  : undefined,
-              });
-              lastStatus = response.status;
-              if (response.ok) break;
-            } catch {
-              response = null;
-            }
-          }
-          if (!response?.ok) {
-            throw new Error(`HLS 分片 ${index + 1} 读取失败（${lastStatus}）`);
-          }
-          let part = await response.blob();
-          if (resource.range && response.status === 200 && part.size > resource.range.length) {
-            part = part.slice(resource.range.start, resource.range.start + resource.range.length);
-          }
-          return part;
-        };
-        const parallelism = 4;
-        for (let start = 0; start < resources.length; start += parallelism) {
-          const batch = await Promise.all(
-            resources
-              .slice(start, start + parallelism)
-              .map((resource, offset) => fetchPart(resource, start + offset)),
-          );
-          batch.forEach((part, offset) => {
-            parts[start + offset] = part;
-            totalSize += part.size;
-          });
-          if (totalSize > 500 * 1024 * 1024) {
-            throw new Error("单个 HLS 视频超过 500 MB，已停止处理。");
-          }
-          const completed = Math.min(resources.length, start + batch.length);
-          reportProgress(
-            12 + Math.round((completed / resources.length) * 80),
-            `正在并行读取 HLS 分片 ${completed}/${resources.length}…`,
-          );
-        }
-        const firstPath = new URL(
-          resources[hasInitSegment ? 1 : 0]?.urls?.[0] || resources[0].urls[0],
-        ).pathname;
-        const extension = hasInitSegment || /\.(?:m4s|mp4)$/i.test(firstPath) ? "mp4" : "ts";
-        const outputName = filename.replace(/\.[a-zA-Z0-9]{2,5}$/i, `.${extension}`);
-        startBlobDownload(
-          new Blob(parts, { type: extension === "mp4" ? "video/mp4" : "video/mp2t" }),
-          outputName,
-        );
-        reportProgress(100, "HLS 视频已开始下载");
-        return { started: true, size: totalSize, extension };
-      } catch (error) {
-        lastError = error;
-      }
-    }
-    return { started: false, error: lastError?.message || "当前页面无法读取视频。" };
-  };
-  return requestedFormat === "hls" ? downloadHls() : downloadDirect();
-}
-
-async function startSecretMediaDownloadInTab(tabId, urls, format, filename) {
-  const jobId = crypto.randomUUID();
-  try {
-    await setActiveJob({
-      jobId,
-      type: "page-media",
-      percent: 3,
-      text: "正在通过当前网页读取视频…",
-      outputFilename: filename,
-      startedAt: Date.now(),
-      updatedAt: Date.now(),
-    });
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
-      func: downloadSecretMediaInsidePage,
-      args: [
-        urls,
-        format,
-        filename,
-        chrome.runtime.getURL("vendor/mediabunny/mediabunny.min.mjs"),
-        jobId,
-      ],
-    });
-    const result = results?.[0]?.result || null;
-    await clearActiveJob(jobId, result?.started ? "completed" : "failed");
-    return result;
-  } catch {
-    await clearActiveJob(jobId, "failed").catch(() => {});
-    return null;
-  }
-}
-
 async function downloadSecretVideo(tab, rawVideo, preferredIndex = 0) {
   const siteKind = secretSiteKindFromUrl(tab?.url);
   if (!tab?.id || !siteKind) {
     throw new Error("当前标签页不是受支持的视频页面。");
   }
-  const requestedVideo = rawVideo?.candidates?.length
+  const video = rawVideo?.candidates?.length
     ? normalizeSecretVideo(rawVideo, [], siteKind)
     : await readSecretVideoFromTab(tab);
-  const requestedCandidates = Array.isArray(requestedVideo?.candidates)
-    ? requestedVideo.candidates
-    : [];
-  const selectedIndex = Math.max(
-    0,
-    Math.min(requestedCandidates.length - 1, Number(preferredIndex) || 0),
-  );
-  const requestedCandidate = requestedCandidates[selectedIndex];
-  let freshVideo = null;
-  if (
-    siteKind === "pornhub" &&
-    requestedCandidate?.verified !== true &&
-    requestedCandidate?.probeRestricted !== true
-  ) {
-    try {
-      const refreshed = await readSecretVideosFromTab(tab);
-      freshVideo = refreshed.videos.find((item) => item?.candidates?.length) || null;
-    } catch {
-      // Keep the selected URL as a fallback if the page refresh cannot be read.
-    }
-  }
-  const freshCandidates = Array.isArray(freshVideo?.candidates)
-    ? freshVideo.candidates
-    : [];
-  const requestedFormat = secretCandidateFormat(requestedCandidate);
-  const requestedQuality = secretCandidateQuality(requestedCandidate);
-  const freshCandidate =
-    freshCandidates.find(
-      (candidate) =>
-        secretCandidateFormat(candidate) === requestedFormat &&
-        (!requestedQuality || secretCandidateQuality(candidate) === requestedQuality),
-    ) ||
-    freshCandidates.find(
-      (candidate) => secretCandidateFormat(candidate) === requestedFormat,
-    );
-  const video = freshVideo || requestedVideo;
   const candidates = Array.isArray(video?.candidates) ? video.candidates : [];
   if (!candidates.length) {
     throw new Error("当前页面没有可下载的视频地址。");
   }
-  let selected = freshCandidate || requestedCandidate || candidates[0];
-  const candidateUrls = (...sourceCandidates) => [...new Set(
-    sourceCandidates
-      .filter(Boolean)
-      .flatMap((candidate) => [
-        candidate?.url,
-        ...(Array.isArray(candidate?.fallbackUrls) ? candidate.fallbackUrls : []),
-      ])
-      .map((url) => String(url || ""))
-      .filter((url) => /^https?:\/\//i.test(url)),
-  )];
-  let urls = candidateUrls(selected, requestedCandidate);
+  const selectedIndex = Math.max(
+    0,
+    Math.min(candidates.length - 1, Number(preferredIndex) || 0),
+  );
+  const selected = candidates[selectedIndex];
+  const urls = [...new Set([
+    selected?.url,
+    ...(Array.isArray(selected?.fallbackUrls) ? selected.fallbackUrls : []),
+  ])]
+    .map((url) => String(url || ""))
+    .filter((url) => /^https?:\/\//i.test(url));
   if (!urls.length) throw new Error("所选画质没有可下载的视频地址。");
 
   const siteLabel = siteKind === "onlyfans" ? "OnlyFans" : "Pornhub";
   const basename =
     sanitizeFilename(video.title || `${siteLabel} 视频`).slice(0, 96).replace(/[ .-]+$/g, "") ||
     `${siteLabel} 视频`;
-  let format = secretCandidateFormat(selected);
-  let verifiedDirectError = null;
-  if (
-    siteKind === "pornhub" &&
-    format !== "hls" &&
-    (selected?.verified === true || selected?.probeRestricted === true)
-  ) {
-    const extension = format === "webm" ? "webm" : "mp4";
-    const outputFilename = secretDownloadFilename(basename, selected, extension);
-    try {
-      const downloadId = await startMediaDownloadWithFallback(
-        urls,
-        outputFilename,
-        `${siteLabel} 视频`,
-      );
-      await notify(`定格：${siteLabel} 视频下载已开始`, `正在保存“${basename}”。`);
-      return {
-        background: false,
-        downloadId,
-        filename: outputFilename,
-      };
-    } catch (error) {
-      verifiedDirectError = error;
-    }
-  }
-  if (siteKind === "pornhub") {
-    if (format !== "hls" && !verifiedDirectError) {
-      const pageDownload = await startSecretMediaDownloadInTab(
-        tab.id,
-        urls,
-        format,
-        secretDownloadFilename(basename, selected),
-      );
-      if (pageDownload?.started) {
-        await notify(
-          `定格：${siteLabel} 视频下载已开始`,
-          `已从当前网页读取并保存“${basename}”。`,
-        );
-        return {
-          background: false,
-          pageDownload: true,
-          filename: secretDownloadFilename(
-            basename,
-            selected,
-            pageDownload.extension || (format === "webm" ? "webm" : "mp4"),
-          ),
-        };
-      }
-    }
-    if (format !== "hls") {
-      const hlsFallback = selectSecretHlsFallback(
-        candidates,
-        secretCandidateQuality(selected),
-      );
-      if (hlsFallback) {
-        selected = hlsFallback;
-        format = "hls";
-        urls = candidateUrls(hlsFallback);
-      }
-    }
-  }
-  if (verifiedDirectError && format !== "hls") throw verifiedDirectError;
+  const format = secretCandidateFormat(selected);
   if (format === "hls") {
-    const outputFilename = secretDownloadFilename(basename, selected, "mp4");
-    let hlsUrls = urls;
-    let prefetchedPlaylist = null;
-    for (const url of urls) {
-      prefetchedPlaylist = await fetchHlsPlaylistFromTab(tab.id, url);
-      if (!prefetchedPlaylist) continue;
-      hlsUrls = [url, ...urls.filter((candidate) => candidate !== url)];
-      break;
-    }
     const jobId = crypto.randomUUID();
     await startHlsTask({
       jobId,
-      items: [{
-        url: hlsUrls[0],
-        urls: hlsUrls,
-        name: outputFilename,
-        pageUrl: tab.url,
-        tabId: tab.id,
-        prefetchedPlaylist,
-      }],
+      items: [{ url: urls[0], urls, name: `${basename}.mp4` }],
     });
-    return { background: true, jobId, filename: outputFilename };
+    await notify(
+      `定格：${siteLabel} 视频处理已启动`,
+      "正在后台读取并合并当前页面的 HLS 视频。",
+    );
+    return { background: true, jobId, filename: `${basename}.mp4` };
   }
 
   const extension = format === "webm" ? "webm" : "mp4";
-  const outputFilename = secretDownloadFilename(basename, selected, extension);
-  const workingUrl = await findFirstWorkingVideoUrl(urls);
-  const orderedUrls = workingUrl
-    ? [workingUrl, ...urls.filter((url) => url !== workingUrl)]
-    : urls;
   const downloadId = await startMediaDownloadWithFallback(
-    orderedUrls,
-    outputFilename,
+    urls,
+    `${basename}.${extension}`,
     `${siteLabel} 视频`,
   );
   await notify(`定格：${siteLabel} 视频下载已开始`, `正在保存“${basename}”。`);
   return {
     background: false,
     downloadId,
-    filename: outputFilename,
+    filename: `${basename}.${extension}`,
   };
 }
 
@@ -4344,28 +3235,14 @@ async function startMediaDownloadWithFallback(urls, filename, label = "媒体") 
         if (download?.state === "interrupted") {
           throw new Error(download.error || "CDN 中断了下载。");
         }
-        const responseMime = String(download?.mime || "").toLowerCase();
-        const returnedTextPage =
+        if (
           !/\.txt$/i.test(filename) &&
-          (responseMime.startsWith("text/") ||
-            responseMime.includes("html") ||
-            /\.(?:txt|html?)(?:$|[?#])/i.test(download?.filename || "") ||
-            /\.(?:txt|html?)(?:$|[?#])/i.test(download?.finalUrl || ""));
-        if (returnedTextPage) {
+          /\.(?:txt|html?)$/i.test(download?.filename || "")
+        ) {
           try {
             await chrome.downloads.cancel?.(downloadId);
           } catch {
             // The failed text response may already have stopped.
-          }
-          try {
-            await chrome.downloads.removeFile?.(downloadId);
-          } catch {
-            // The browser may have already removed the failed response.
-          }
-          try {
-            await chrome.downloads.erase?.({ id: downloadId });
-          } catch {
-            // Removing the failed item from download history is best-effort.
           }
           throw new Error("CDN 返回了文本错误页，已拒绝保存并切换备用地址。");
         }
@@ -5340,15 +4217,7 @@ if (chrome.tabs.onActivated?.addListener) {
 }
 
 if (chrome.tabs.onUpdated?.addListener) {
-  chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-    if (changeInfo.url) {
-      getSecretScanState(tabId).then((scanState) => {
-        if (scanState && !sameSecretPage(scanState.pageUrl, changeInfo.url)) {
-          clearSecretScanState(tabId).catch(() => {});
-          clearCachedSecretVideos(tabId).catch(() => {});
-        }
-      }).catch(() => {});
-    }
+  chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
     if (tab?.active && (changeInfo.url || changeInfo.status === "complete")) {
       updateSiteVideoMenus(changeInfo.url || tab.url || "");
     }
@@ -5453,60 +4322,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.target !== "background") return;
 
-  if (message.type === "DINGGE_FETCH_HLS_RESOURCE_FROM_TAB") {
-    if (sender.url && sender.url !== chrome.runtime.getURL(OFFSCREEN_PATH)) {
-      sendResponse({ ok: false, status: 0 });
-      return;
-    }
-    fetchHlsResourceFromTab(
-      Number(message.tabId || 0),
-      message.urls,
-      message.range || null,
-    )
-      .then((result) => sendResponse(result))
-      .catch(() => sendResponse({ ok: false, status: 0 }));
-    return true;
-  }
-
-  if (message.type === "DINGGE_FETCH_HLS_PLAYLIST_FROM_TAB") {
-    if (sender.url && sender.url !== chrome.runtime.getURL(OFFSCREEN_PATH)) {
-      sendResponse({ ok: false });
-      return;
-    }
-    fetchHlsPlaylistFromTab(
-      Number(message.tabId || 0),
-      String(message.url || ""),
-    )
-      .then((playlist) => sendResponse({ ok: Boolean(playlist), playlist }))
-      .catch(() => sendResponse({ ok: false }));
-    return true;
-  }
-
-  if (message.type === "DINGGE_GET_SECRET_SCAN_STATUS") {
-    (async () => {
-      const tabId = Number(sender.tab?.id || message.tabId || 0);
-      const tab = sender.tab || (tabId ? await chrome.tabs.get(tabId) : null);
-      if (!tab?.id) return { requested: false };
-      return secretScanStatusForTab(tab);
-    })()
-      .then((status) => sendResponse(status))
-      .catch(() => sendResponse({ requested: false }));
-    return true;
-  }
-
   if (message.type === "DINGGE_GET_SECRET_VIDEO") {
     (async () => {
       const tabId = Number(sender.tab?.id || message.tabId || 0);
       const tab = sender.tab || (tabId ? await chrome.tabs.get(tabId) : null);
       if (!tab?.id) throw new Error("无法取得当前视频标签页。");
-      await beginPersistentSecretScan(tab, true);
-      const scanState = await getSecretScanState(tab.id);
-      sendResponse({
-        ok: true,
-        scanning: true,
-        percent: Number(scanState?.percent) || 5,
-        text: String(scanState?.text || "正在准备识别当前页面…"),
-      });
+      const result = await readSecretVideosFromTab(tab);
+      const video = result.videos.find((item) => item?.candidates?.length) || result.videos[0];
+      sendResponse({ ok: true, video, ...result });
     })().catch((error) => {
       sendResponse({
         ok: false,
@@ -5518,12 +4341,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "DINGGE_START_SECRET_DOWNLOAD") {
     (async () => {
-      const activeJob = await getActiveJob();
-      if (activeJob) {
-        throw new Error(
-          `当前仅支持一个下载或合并任务，请等待“${activeJob.outputFilename || activeJob.text || "当前任务"}”完成。`,
-        );
-      }
       const tabId = Number(sender.tab?.id || message.tabId || 0);
       const tab = sender.tab || (tabId ? await chrome.tabs.get(tabId) : null);
       if (!tab?.id) throw new Error("无法取得当前视频标签页。");
@@ -5801,7 +4618,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (
     message.type === "DINGGE_ZIP_PROGRESS" ||
     message.type === "DINGGE_HLS_PROGRESS" ||
-    message.type === "DINGGE_PAGE_MEDIA_PROGRESS" ||
     message.type === "DINGGE_DASH_MUX_PROGRESS" ||
     message.type === "DINGGE_BILIBILI_PARTS_ZIP_PROGRESS"
   ) {

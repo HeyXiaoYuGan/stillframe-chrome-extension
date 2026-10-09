@@ -16,6 +16,6 @@
 
 The bundled minified module contains its MPL-2.0 copyright header but no reliable package version identifier, source map, package manifest, release tag, or other verifiable version evidence. The previous README statement naming a version was therefore not treated as authoritative. To avoid guessing, the exact bundled version is recorded as unknown; the SHA-256 above is the reproducible identity of the bundled file.
 
-Mediabunny is used locally in the Offscreen document to remux Bilibili DASH video and audio tracks, and in the current webpage as the preferred HLS/MPEG-TS-to-MP4 remuxing engine, without intentionally re-encoding them.
+Mediabunny is used locally in the Offscreen document to remux Bilibili DASH video and audio tracks into an MP4 container without intentionally re-encoding them.
 
 StillFrame's MIT license does not replace or alter Mediabunny's MPL-2.0 terms. When redistributing this repository or a packaged extension, retain the bundled minified module, its existing header, this notice, and `vendor/mediabunny/LICENSE.txt`.

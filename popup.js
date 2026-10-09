@@ -1,5 +1,5 @@
-const surface = new URLSearchParams(window.location.search).get("surface");
-const isPersistentSurface = surface === "window" || surface === "sidepanel";
+const isPersistentSurface =
+  new URLSearchParams(window.location.search).get("surface") === "window";
 document.documentElement.classList.toggle("persistent-window", isPersistentSurface);
 
 const state = {
@@ -36,11 +36,6 @@ const state = {
   secretVideo: null,
   secretVideos: [],
   secretVideoIndex: -1,
-  secretScanRequested: false,
-  secretScanInProgress: false,
-  secretScanPollTimer: 0,
-  persistentSyncTimer: 0,
-  pendingHlsTerminalMessages: new Map(),
 };
 const pendingImageMeasurements = new Map();
 let imageMeasurementGeneration = 0;
@@ -49,7 +44,6 @@ const BILIBILI_ZIP_CHUNK_LIMIT = 4_000_000_000;
 const elements = {
   versionLabel: document.querySelector("#versionLabel"),
   openOptionsButton: document.querySelector("#openOptionsButton"),
-  pinWindowButton: document.querySelector("#pinWindowButton"),
   openGalleryButton: document.querySelector("#openGalleryButton"),
   featureTabs: [...document.querySelectorAll(".feature-tab")],
   secretEntryButton: document.querySelector("#secretEntryButton"),
@@ -460,7 +454,6 @@ async function initialize() {
   try {
     state.tab = await getActiveTab();
     state.pageUrl = state.tab?.url || "";
-    elements.pinWindowButton.disabled = !state.tab?.windowId;
 
     if (!canAccessPage(state.tab?.url)) {
       showMessage(
@@ -475,7 +468,7 @@ async function initialize() {
       } else if (state.feature === "douyin") {
         await scanDouyinVideo();
       } else if (state.feature === "secret") {
-        await restoreSecretScanState();
+        await scanSecretVideo();
       } else {
         await syncImagesFromPage();
         await syncNetworkMedia();
@@ -487,10 +480,6 @@ async function initialize() {
     elements.captureButton.disabled = true;
   }
   await syncBackgroundJob();
-  if (isPersistentSurface) {
-    await refreshPersistentSurface().catch(() => {});
-    schedulePersistentSurfaceRefresh();
-  }
 }
 
 function showBackgroundJob(job) {
@@ -498,69 +487,15 @@ function showBackgroundJob(job) {
   state.backgroundJobId = job.jobId;
   if (job.type === "zip") state.zipJobId = job.jobId;
   if (job.type === "hls") state.hlsJobId = job.jobId;
-  setProgress(
-    job.percent || 0,
-    `${job.text || "后台正在处理媒体…"}${
-      isPersistentSurface ? " · 当前仅支持单任务" : ""
-    }`,
-  );
-  elements.cancelJobButton.hidden = job.type === "page-media";
-  setBusy(!isPersistentSurface);
+  setProgress(job.percent || 0, job.text || "后台正在处理媒体…");
+  elements.cancelJobButton.hidden = false;
+  setBusy(true);
 }
 
 function clearBackgroundJobUI() {
   state.backgroundJobId = "";
   elements.cancelJobButton.hidden = true;
   setBusy(false);
-}
-
-async function syncPersistentSourceTab() {
-  if (!isPersistentSurface) return;
-  const nextTab = await getActiveTab();
-  if (!nextTab?.id || nextTab.id === state.tab?.id) return;
-  state.tab = nextTab;
-  state.pageUrl = nextTab.url || "";
-  state.secretScanRequested = false;
-  state.secretScanInProgress = false;
-  stopSecretScanPolling();
-  renderSecretVideos([]);
-  elements.secretScanButtonText.textContent = "识别当前页面视频";
-  if (state.feature === "secret") await restoreSecretScanState();
-}
-
-async function refreshPersistentSurface() {
-  if (!isPersistentSurface) return;
-  await syncPersistentSourceTab().catch(() => {});
-  await syncBackgroundJob();
-}
-
-function schedulePersistentSurfaceRefresh() {
-  if (!isPersistentSurface) return;
-  clearTimeout(state.persistentSyncTimer);
-  state.persistentSyncTimer = setTimeout(async () => {
-    await refreshPersistentSurface().catch(() => {});
-    schedulePersistentSurfaceRefresh();
-  }, 1000);
-}
-
-function handleHlsTerminalMessage(message) {
-  if (message.type === "DINGGE_HLS_DOWNLOAD_COMPLETE") {
-    clearBackgroundJobUI();
-    setProgress(100, "HLS 视频已开始下载");
-    showMessage(
-      message.failedCount
-        ? `已合并 ${message.successCount} 个 HLS 视频，${message.failedCount} 个处理失败。`
-        : `完成！${message.successCount} 个 HLS 视频已合并并开始下载。`,
-      message.successCount ? "success" : "error",
-    );
-    setTimeout(() => {
-      elements.progress.hidden = true;
-    }, 1800);
-    return;
-  }
-  clearBackgroundJobUI();
-  elements.progress.hidden = true;
-  showMessage(message.error || "HLS 视频处理失败。", "error");
 }
 
 async function syncBackgroundJob() {
@@ -570,10 +505,6 @@ async function syncBackgroundJob() {
       target: "background",
     });
     if (response?.job) showBackgroundJob(response.job);
-    else if (state.backgroundJobId) {
-      clearBackgroundJobUI();
-      elements.progress.hidden = true;
-    }
   } catch {
     // The rest of the popup remains usable if status restoration fails.
   }
@@ -782,6 +713,19 @@ function secretCandidateQualityNumber(candidate = {}) {
   return 0;
 }
 
+function secretQualityBitrate(quality) {
+  if (quality <= 0) return 0;
+  if (quality <= 240) return 450_000;
+  if (quality <= 360) return 800_000;
+  if (quality <= 480) return 1_200_000;
+  if (quality <= 540) return 1_600_000;
+  if (quality <= 720) return 2_500_000;
+  if (quality <= 1080) return 5_000_000;
+  if (quality <= 1440) return 9_000_000;
+  if (quality <= 2160) return 18_000_000;
+  return 32_000_000;
+}
+
 function estimateSecretCandidateSize(video = {}, candidate = {}) {
   const exactSize = Number(
     candidate.sizeBytes || candidate.fileSize || candidate.contentLength || 0,
@@ -793,9 +737,6 @@ function estimateSecretCandidateSize(video = {}, candidate = {}) {
   if (Number.isFinite(suppliedEstimate) && suppliedEstimate > 0) {
     return { sizeBytes: Math.round(suppliedEstimate), estimated: true };
   }
-  if (candidate.probeRestricted === true) {
-    return { sizeBytes: 0, estimated: true };
-  }
   const duration = Number(video.duration || 0);
   if (!Number.isFinite(duration) || duration <= 0) {
     return { sizeBytes: 0, estimated: true };
@@ -803,12 +744,10 @@ function estimateSecretCandidateSize(video = {}, candidate = {}) {
   let bitrate = Number(candidate.bitrate || candidate.bandwidth || 0);
   if (bitrate > 0 && bitrate < 100_000) bitrate *= 1000;
   if (!Number.isFinite(bitrate) || bitrate <= 0 || bitrate > 1_000_000_000) {
-    return { sizeBytes: 0, estimated: true };
+    bitrate = secretQualityBitrate(secretCandidateQualityNumber(candidate));
   }
-  const includesAudio = /m3u8|\bhls\b/i.test(
-    `${candidate.format || ""} ${candidate.streamType || ""} ${candidate.url || ""}`,
-  );
-  const audioBitrate = includesAudio ? 0 : 128_000;
+  if (!bitrate) return { sizeBytes: 0, estimated: true };
+  const audioBitrate = 128_000;
   return {
     sizeBytes: Math.round((duration * (bitrate + audioBitrate) * 1.03) / 8),
     estimated: true,
@@ -829,9 +768,7 @@ function formatSecretFileSize(sizeBytes, estimated = true) {
 
 function secretCandidateSizeLabel(video, candidate) {
   const size = estimateSecretCandidateSize(video, candidate);
-  return size.sizeBytes
-    ? formatSecretFileSize(size.sizeBytes, size.estimated)
-    : "大小下载时确认";
+  return formatSecretFileSize(size.sizeBytes, size.estimated);
 }
 
 function secretCandidateDisplayLabel(video, candidate, index = 0) {
@@ -974,7 +911,6 @@ function renderSecretVideos(
 
 async function scanSecretVideo() {
   if (state.busy) return;
-  state.secretScanRequested = true;
   state.tab = await getActiveTab();
   state.pageUrl = state.tab?.url || "";
   if (!state.tab?.id || !secretSiteKind(state.tab.url)) {
@@ -985,24 +921,12 @@ async function scanSecretVideo() {
   setBusy(true);
   showMessage("");
   elements.secretScanButtonText.textContent = "正在识别当前页面视频…";
-  setProgress(5, "正在准备识别当前页面…");
   try {
     const response = await chrome.runtime.sendMessage({
       type: "DINGGE_GET_SECRET_VIDEO",
       target: "background",
       tabId: state.tab.id,
     });
-    if (response?.ok && response.scanning) {
-      handleSecretScanStatus({
-        requested: true,
-        active: true,
-        status: "scanning",
-        percent: response.percent,
-        text: response.text,
-      });
-      showMessage("识别已在后台继续，关闭插件面板不会中断。", "success");
-      return;
-    }
     const videos = Array.isArray(response?.videos)
       ? response.videos
       : response?.video
@@ -1025,92 +949,7 @@ async function scanSecretVideo() {
     showMessage(error?.message || "当前页面视频识别失败。", "error");
   } finally {
     setBusy(false);
-    elements.secretScanButton.disabled = state.secretScanInProgress;
   }
-}
-
-function handleSecretScanStatus(status) {
-  if (!status?.requested) {
-    if (state.secretScanInProgress) {
-      state.secretScanInProgress = false;
-      elements.secretScanButton.disabled = false;
-      elements.progress.hidden = true;
-      stopSecretScanPolling();
-    }
-    return;
-  }
-  state.secretScanRequested = true;
-  if (status.active || status.status === "scanning") {
-    if (
-      Array.isArray(status.videos) &&
-      status.videos.length &&
-      !state.secretVideos.length
-    ) {
-      renderSecretVideos(status.videos);
-    }
-    state.secretScanInProgress = true;
-    elements.secretScanButton.disabled = true;
-    elements.secretScanButtonText.textContent = "正在识别当前页面视频…";
-    const currentPercent = Number.parseInt(
-      elements.progressPercent.textContent,
-      10,
-    ) || 0;
-    const nextPercent = Math.max(currentPercent, Number(status.percent) || 5);
-    setProgress(nextPercent, status.text || "正在后台识别当前页面视频…");
-    scheduleSecretScanPolling();
-    return;
-  }
-  stopSecretScanPolling();
-  state.secretScanInProgress = false;
-  elements.secretScanButton.disabled = false;
-  elements.progress.hidden = true;
-  if (status.status === "complete" && Array.isArray(status.videos)) {
-    renderSecretVideos(status.videos);
-    elements.secretScanButtonText.textContent = "重新识别当前页面视频";
-    const downloadableCount = status.videos.filter(
-      (video) => video?.candidates?.length,
-    ).length;
-    showMessage(
-      status.warning ||
-        `已识别 ${status.videos.length} 个页面视频，其中 ${downloadableCount} 个可下载。`,
-      downloadableCount ? "success" : "error",
-    );
-    return;
-  }
-  elements.secretScanButtonText.textContent = "识别当前页面视频";
-  if (status.error) showMessage(status.error, "error");
-}
-
-function stopSecretScanPolling() {
-  if (!state.secretScanPollTimer) return;
-  clearTimeout(state.secretScanPollTimer);
-  state.secretScanPollTimer = 0;
-}
-
-function scheduleSecretScanPolling() {
-  stopSecretScanPolling();
-  if (!state.secretScanInProgress || state.feature !== "secret") return;
-  state.secretScanPollTimer = setTimeout(async () => {
-    state.secretScanPollTimer = 0;
-    try {
-      await restoreSecretScanState();
-    } catch {
-      // A later poll can recover if the service worker was restarting.
-    }
-    if (state.secretScanInProgress && state.feature === "secret") {
-      scheduleSecretScanPolling();
-    }
-  }, 750);
-}
-
-async function restoreSecretScanState() {
-  if (!state.tab?.id || !secretSiteKind(state.tab.url)) return;
-  const status = await chrome.runtime.sendMessage({
-    type: "DINGGE_GET_SECRET_SCAN_STATUS",
-    target: "background",
-    tabId: state.tab.id,
-  });
-  handleSecretScanStatus(status);
 }
 
 async function startSecretDownload() {
@@ -1133,12 +972,6 @@ async function startSecretDownload() {
       state.hlsJobId = response.jobId;
       elements.cancelJobButton.hidden = false;
       setProgress(4, "已找到 HLS，正在读取播放列表…");
-      const earlyTerminal = state.pendingHlsTerminalMessages.get(response.jobId);
-      if (earlyTerminal) {
-        state.pendingHlsTerminalMessages.delete(response.jobId);
-        handleHlsTerminalMessage(earlyTerminal);
-        return;
-      }
     }
     showMessage(
       response.background
@@ -1667,7 +1500,6 @@ async function startPanelBilibiliDownload(packageParts = false) {
 
 function updateFeature(feature) {
   state.feature = feature;
-  if (feature !== "secret") stopSecretScanPolling();
   elements.featureTabs.forEach((button) => {
     button.classList.toggle("active", button.dataset.feature === feature);
   });
@@ -1692,8 +1524,13 @@ function updateFeature(feature) {
     !state.busy
   ) {
     scanDouyinVideo();
-  } else if (feature === "secret" && state.tab?.id) {
-    restoreSecretScanState().catch(() => {});
+  } else if (
+    feature === "secret" &&
+    state.tab?.id &&
+    !state.secretVideo &&
+    !state.busy
+  ) {
+    scanSecretVideo();
   } else if (
     feature === "bilibili" &&
     state.tab?.id &&
@@ -3372,19 +3209,6 @@ elements.imageFilterLevelSelect.addEventListener("change", () => {
 elements.openOptionsButton.addEventListener("click", () => {
   chrome.runtime.openOptionsPage();
 });
-elements.pinWindowButton.hidden = isPersistentSurface;
-elements.pinWindowButton.addEventListener("click", async () => {
-  try {
-    if (!state.tab?.windowId || !chrome.sidePanel?.open) {
-      throw new Error("当前浏览器不支持固定侧边栏。");
-    }
-    const opening = chrome.sidePanel.open({ windowId: state.tab.windowId });
-    await opening;
-    window.close();
-  } catch (error) {
-    showMessage(error?.message || "无法固定到侧边栏。", "error");
-  }
-});
 elements.captureOptions.forEach((option) => {
   option.addEventListener("click", () => updateMode(option.dataset.mode));
 });
@@ -3489,15 +3313,9 @@ chrome.storage.onChanged?.addListener((changes, areaName) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender) => {
-  if (message?.type === "DINGGE_SECRET_SCAN_STATUS") {
-    if (message.tabId !== state.tab?.id || state.feature !== "secret") return;
-    handleSecretScanStatus(message);
-    return;
-  }
   if (message?.type === "DINGGE_SECRET_VIDEOS_UPDATED") {
     if (
       state.feature !== "secret" ||
-      !state.secretScanRequested ||
       sender.tab?.id !== state.tab?.id ||
       !Array.isArray(message.videos)
     ) return;
@@ -3533,28 +3351,29 @@ chrome.runtime.onMessage.addListener((message, sender) => {
     return;
   }
 
-  if (
-    message?.jobId &&
-    ["DINGGE_HLS_DOWNLOAD_COMPLETE", "DINGGE_HLS_DOWNLOAD_ERROR"].includes(
-      message.type,
-    ) &&
-    message.jobId !== state.hlsJobId
-  ) {
-    state.pendingHlsTerminalMessages.set(message.jobId, message);
-    return;
-  }
-
   if (message?.jobId && message.jobId === state.hlsJobId) {
     if (message.type === "DINGGE_HLS_PROGRESS") {
       setProgress(message.percent || 0, message.text || "后台正在合并 HLS 分片…");
       return;
     }
     if (message.type === "DINGGE_HLS_DOWNLOAD_COMPLETE") {
-      handleHlsTerminalMessage(message);
+      clearBackgroundJobUI();
+      setProgress(100, "HLS 视频已开始下载");
+      showMessage(
+        message.failedCount
+          ? `已合并 ${message.successCount} 个 HLS 视频，${message.failedCount} 个处理失败。`
+          : `完成！${message.successCount} 个 HLS 视频已合并并开始下载。`,
+        message.successCount ? "success" : "error",
+      );
+      setTimeout(() => {
+        elements.progress.hidden = true;
+      }, 1800);
       return;
     }
     if (message.type === "DINGGE_HLS_DOWNLOAD_ERROR") {
-      handleHlsTerminalMessage(message);
+      clearBackgroundJobUI();
+      elements.progress.hidden = true;
+      showMessage(message.error || "HLS 视频处理失败。", "error");
       return;
     }
   }

@@ -16,28 +16,6 @@
       return "";
     }
   };
-  const fetchWithTimeout = async (url, options = {}, timeoutMs = 2500) => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      return await fetch(url, { ...options, signal: controller.signal });
-    } finally {
-      clearTimeout(timer);
-    }
-  };
-  const readTextWithTimeout = async (response, timeoutMs = 2500) => {
-    let timer;
-    try {
-      return await Promise.race([
-        response.text(),
-        new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error("response body timeout")), timeoutMs);
-        }),
-      ]);
-    } finally {
-      clearTimeout(timer);
-    }
-  };
   const mediaFormat = (rawUrl, hint = "") => {
     const value = `${hint} ${rawUrl}`.toLowerCase();
     if (/m3u8|\bhls\b/.test(value)) return "hls";
@@ -57,8 +35,6 @@
   const endpoints = new Map();
   let sawBlobUrl = false;
   let sawDashManifest = false;
-  const inspectedObjects = new WeakSet();
-  let inspectedObjectCount = 0;
   const isPornhubHostname = (hostname) => {
     const normalized = text(hostname).toLowerCase().replace(/\.$/, "");
     return [
@@ -105,9 +81,7 @@
       endpoints.set(url, { ...metadata });
       return;
     }
-    // Parent objects can declare format=mp4 while also carrying page or
-    // tracking URLs. Require the URL itself to identify a media resource.
-    const format = mediaFormat(url);
+    const format = mediaFormat(url, metadata.format || metadata.type || "");
     const quality = qualityNumber(
       metadata.quality,
       metadata.qualityLabel,
@@ -141,12 +115,14 @@
       return;
     }
     if (!root || typeof root !== "object") return;
+    const visited = new WeakSet();
     const stack = [{ value: root, depth: 0 }];
-    while (stack.length && inspectedObjectCount < 6000) {
+    let visitedCount = 0;
+    while (stack.length && visitedCount < 20000) {
       const { value, depth } = stack.pop();
-      if (!value || typeof value !== "object" || inspectedObjects.has(value)) continue;
-      inspectedObjects.add(value);
-      inspectedObjectCount += 1;
+      if (!value || typeof value !== "object" || visited.has(value)) continue;
+      visited.add(value);
+      visitedCount += 1;
       const metadata = {
         quality: value.quality ?? value.qualityLabel ?? value.height,
         format: value.format ?? value.type ?? value.mediaType,
@@ -166,7 +142,7 @@
         value.remoteUrl,
         value.remote_url,
       ].forEach((url) => addCandidate(url, metadata));
-      if (depth >= 8) continue;
+      if (depth >= 12) continue;
       const children = Array.isArray(value) ? value : Object.values(value);
       for (let index = children.length - 1; index >= 0; index -= 1) {
         const child = children[index];
@@ -300,7 +276,7 @@
     ...[...(pageVideo?.querySelectorAll?.("source") || [])].map((source) => source.src),
     jsonLd?.contentUrl,
   ].forEach((url) => addCandidate(url));
-  [...(document.scripts || [])].slice(-120).forEach((script) => {
+  [...(document.scripts || [])].slice(-300).forEach((script) => {
     const body = script.textContent || "";
     if (!/(?:mediaDefinitions?|videoUrl|mediaUrl|playbackUrl|downloadUrl)/i.test(body)) return;
     scriptMediaUrls(body).forEach((url) => addCandidate(url));
@@ -321,15 +297,15 @@
     // Resource timing can be unavailable or cleared by the page.
   }
 
-  await Promise.all([...endpoints.entries()].slice(0, 8).map(async ([endpoint, metadata]) => {
+  for (const [endpoint, metadata] of [...endpoints.entries()].slice(0, 8)) {
     try {
-      const response = await fetchWithTimeout(endpoint, {
+      const response = await fetch(endpoint, {
         credentials: "include",
         cache: "no-store",
         headers: { Accept: "application/json, text/plain, */*" },
       });
-      if (!response.ok) return;
-      const body = await readTextWithTimeout(response);
+      if (!response.ok) continue;
+      const body = await response.text();
       try {
         const parsed = JSON.parse(body);
         if (typeof parsed === "string") addCandidate(parsed, metadata);
@@ -340,7 +316,7 @@
     } catch {
       // A failed quality endpoint must not hide direct media URLs already found.
     }
-  }));
+  }
 
   const orderedCandidates = [...candidates.values()]
     .sort(

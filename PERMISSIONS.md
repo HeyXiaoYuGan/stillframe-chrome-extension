@@ -7,11 +7,10 @@
 | 权限 | 用途 |
 | --- | --- |
 | `contextMenus` | 创建图片、视频、打包、截图、Pinterest、抖音和 B站操作的右键菜单。 |
-| `declarativeNetRequestWithHostAccess` | 创建媒体下载来源规则：访问 `bilivideo.com` / `bilivideo.cn` 时设置 B站 Referer；访问抖音及字节媒体 CDN 时设置抖音 Referer；访问 `phncdn.com` 视频 CDN 时设置对应播放器页面的 Referer 与 Origin。它们使 Chrome 下载与页面正常播放请求保持相同来源边界，不修改 Cookie、Authorization 或响应内容。 |
+| `declarativeNetRequestWithHostAccess` | 创建两条媒体下载规则：访问 `bilivideo.com` / `bilivideo.cn` 时设置 B站 Referer；访问抖音及字节媒体 CDN 时设置 `Referer: https://www.douyin.com/`。它们使 Chrome 下载与页面正常播放请求保持相同来源边界，不修改 Cookie、Authorization 或响应内容。 |
 | `downloads` | 把图片、媒体、ZIP、截图、PDF、HLS 合并结果和 B站封装结果交给 Chrome 下载管理器，并设置安全文件名。 |
 | `notifications` | 在用户允许时提示后台打包、下载、合并的完成或失败状态。可在设置中关闭。 |
 | `offscreen` | 在弹窗关闭后继续生成 ZIP、读取 HLS 分片、封装 B站 DASH 音视频和创建 Blob 下载结果。 |
-| `sidePanel` | 用户点击面板标题栏的固定按钮时，将界面打开到 Chrome 原生侧边栏并保持常驻。 |
 | `scripting` | 为完整页面截图临时执行页面滚动/尺寸读取；读取当前 B站页面已公开给播放器的标题、BV/AV/CID 等上下文；读取当前抖音页面已加载到播放器状态中的作品信息、全部可用画质、明确提供的编码和封面；在 OnlyFans 页面主世界中从页面自身收到的 JSON 响应副本提取视频元数据；以及在用户主动使用“神秘小入口”时读取当前 OnlyFans 或 Pornhub 页面已加载的标题、封面与媒体地址。 |
 | `storage` | 在 `local` 保存设置，在 `session` 保存短期任务状态和按标签页划分的临时媒体 URL。详细规则见 [PRIVACY.md](PRIVACY.md)。 |
 | `webRequest` | 仅在实时扫描开启时观察网页媒体请求 URL、资源类型和响应 `Content-Type`，用于发现 MP4、WebM、HLS、Pinterest、抖音、OnlyFans、Pornhub 媒体和 B站 DASH。关闭实时扫描后不新增网络媒体记录，仅保留页面导航时的临时记录清理。不会读取请求正文、Cookie 或 Authorization 请求头。 |
