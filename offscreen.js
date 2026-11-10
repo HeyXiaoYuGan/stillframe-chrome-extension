@@ -15,6 +15,7 @@ Logging.level = LogLevel.Silent;
 let busy = false;
 let activeJobId = "";
 let activeAbortController = null;
+const bilibiliTrackReads = new Map();
 
 const BILIBILI_ZIP_CHUNK_LIMIT = 4_000_000_000;
 const BILIBILI_SINGLE_PART_LIMIT = 700 * 1024 * 1024;
@@ -834,24 +835,59 @@ async function runZipJob(message) {
 
 async function fetchFirstMediaBlob(urls, label, signal) {
   let lastError;
-  for (const url of [...new Set((urls || []).filter(Boolean))]) {
+  for (const url of [...new Set((urls || []).filter((value) => /^https?:\/\//i.test(value)))]) {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    if (signal?.aborted) throw new Error("后台任务已取消。");
+    signal?.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(abort, 60000);
     try {
-      const response = await fetchWithTimeout(url, {
+      const response = await fetch(url, {
         credentials: "include",
-        cache: "force-cache",
-      }, 60000, signal);
-      if (!response.ok) throw new Error(`${response.status}`);
+        cache: "no-store",
+        signal: controller.signal,
+      }).finally(() => clearTimeout(timer));
       const contentType = response.headers.get("content-type") || "";
-      if (/text|html|json/i.test(contentType)) {
-        throw new Error("CDN 返回了文本错误页");
+      const range = response.headers.get("content-range")?.match(/^bytes 0-(\d+)\/(\d+)$/i);
+      const partial = response.status === 206 && (!range || Number(range[1]) + 1 !== Number(range[2]));
+      if (!response.ok || partial || /text\/|html|json|xml/i.test(contentType)) {
+        await response.body?.cancel().catch(() => {});
+        throw new Error(partial ? "CDN 只返回了部分媒体" : `CDN 返回了错误响应（HTTP ${response.status}）`);
       }
-      return await response.blob();
+      const blob = await response.blob();
+      const bytes = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
+      const box = readIsoBmffFourCc(bytes, 4);
+      const signature = String.fromCharCode(...bytes);
+      const isMedia = /^(?:ftyp|styp|moov|moof|sidx|free|wide|mdat)$/.test(box) ||
+        /^(?:FLV|fLaC|OggS|ID3)/.test(signature) ||
+        (bytes[0] === 0xff && (bytes[1] & 0xf0) === 0xf0);
+      if (!isMedia) {
+        throw new Error("CDN 返回的数据没有有效的音视频文件头");
+      }
+      return blob;
     } catch (error) {
       lastError = error;
       if (signal?.aborted) throw new Error("后台任务已取消。");
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
     }
   }
   throw new Error(`${label}读取失败：${lastError?.message || "没有可用 CDN"}`);
+}
+
+async function readBilibiliTrackForDownload({ urls, label, jobId }) {
+  const controller = new AbortController();
+  if (jobId) bilibiliTrackReads.set(jobId, controller);
+  try {
+    const blob = await fetchFirstMediaBlob(urls, label, controller.signal);
+    if (controller.signal.aborted) throw new Error("后台任务已取消。");
+    const objectUrl = URL.createObjectURL(blob);
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 120000);
+    return { objectUrl };
+  } finally {
+    if (bilibiliTrackReads.get(jobId) === controller) bilibiliTrackReads.delete(jobId);
+  }
 }
 
 const ISO_BMFF_PROTECTION_SYSTEMS = {
@@ -1540,6 +1576,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
   if (message.type === "DINGGE_CANCEL_OFFSCREEN_JOB") {
+    const trackRead = bilibiliTrackReads.get(message.jobId);
+    if (trackRead) {
+      trackRead.abort();
+      sendResponse({ canceled: true });
+      return;
+    }
     if (busy && (!message.jobId || message.jobId === activeJobId)) {
       activeAbortController?.abort();
       sendResponse({ canceled: true });
@@ -1547,6 +1589,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       sendResponse({ canceled: false });
     }
     return;
+  }
+  if (message.type === "DINGGE_READ_BILIBILI_TRACK") {
+    readBilibiliTrackForDownload(message)
+      .then(sendResponse)
+      .catch((error) => sendResponse({ error: error?.message || "B站媒体读取失败。" }));
+    return true;
   }
   if (
     ![

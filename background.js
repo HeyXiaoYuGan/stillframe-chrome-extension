@@ -75,8 +75,12 @@ async function ensureSiteDownloadHeaders() {
           }],
         },
         condition: {
-          regexFilter:
-            "^https?://([^/]+\\.)?(douyinvod\\.com|douyinstatic\\.com|douyinpic\\.com|bytecdn\\.(cn|com)|byteimg\\.com|bytedance\\.com|bytevcloud\\.com|ibytedtos\\.com|pstatp\\.com|zjcdn\\.com|byted\\.org)/",
+          // A large regex here can make Chrome reject the whole dynamic rule update.
+          requestDomains: [
+            "douyinvod.com", "douyinstatic.com", "douyinpic.com",
+            "bytecdn.cn", "bytecdn.com", "byteimg.com", "bytedance.com",
+            "bytevcloud.com", "ibytedtos.com", "pstatp.com", "zjcdn.com", "byted.org",
+          ],
           resourceTypes: ["media", "other", "xmlhttprequest"],
         },
       },
@@ -1031,6 +1035,7 @@ async function collectTabMedia(tabId) {
     } else if (existing.kind === "video" && normalized.kind === "video") {
       media.set(key, {
         ...existing,
+        streamType: normalized.streamType === "dash-video" ? "dash-video" : existing.streamType,
         hlsUrl: existing.hlsUrl || normalized.hlsUrl,
         hlsUrls: [
           ...new Set([...(existing.hlsUrls || []), ...(normalized.hlsUrls || [])]),
@@ -3345,13 +3350,15 @@ async function downloadContextMedia(info, tab, operationJobId = "") {
         tab.id,
         operationJobId,
       );
-      if (operationJobId && !result.hlsStarted) {
+      if (operationJobId && !result.hlsStarted && !result.muxStarted) {
         await clearActiveJob(operationJobId);
       }
       await notify(
         "定格：B站下载已开始",
         result.hlsStarted
           ? "正在读取 m3u8 并合并视频分片，可在插件面板查看实时进度。"
+          : result.muxStarted
+          ? "正在后台合并 DASH 视频和音频，可在插件面板查看实时进度。"
           : result.audioDownloaded
           ? "视频流和音频流已分别开始下载。"
           : "视频流已开始下载；播放几秒后可再次尝试获取音频。",
@@ -3746,10 +3753,10 @@ async function readBilibiliPartList(pageUrl, tabId = 0) {
     parsedPage.pathname.match(/\/bangumi\/play\/ss(\d+)/i)?.[1] || 0,
   );
   const epId = pathEpId || Number(pageIdentity.epId || 0);
-  const seasonId = pathSeasonId || Number(pageIdentity.seasonId || 0);
   const isPgc = Boolean(
-    epId || seasonId || pageIdentity.isPgc || /\/bangumi\/play\//i.test(parsedPage.pathname),
+    epId || pageIdentity.isPgc || /\/bangumi\/play\//i.test(parsedPage.pathname),
   );
+  const seasonId = isPgc ? pathSeasonId || Number(pageIdentity.seasonId || 0) : 0;
   let pgcSeason = null;
   if (isPgc && (epId || seasonId)) {
     pgcSeason = await bilibiliJson(
@@ -3862,8 +3869,8 @@ async function readBilibiliPartList(pageUrl, tabId = 0) {
       cid,
       aid: Number(part.aid || part.arc?.aid || 0),
       bvid: String(part.bvid || part.arc?.bvid || ""),
-      epId: Number(part.epId || part.ep_id || part.id || 0),
-      seasonId: Number(part.seasonId || part.season_id || seasonId || 0),
+      epId: isPgc ? Number(part.epId || part.ep_id || part.id || 0) : 0,
+      seasonId: isPgc ? Number(part.seasonId || part.season_id || seasonId || 0) : 0,
       title: String(part.part || part.title || `P${index + 1}`).trim(),
       duration: Math.max(0, Number(part.duration) || 0),
     });
@@ -4140,6 +4147,26 @@ function biliProgressiveStreams(playData) {
   return Array.isArray(playData?.durl) ? playData.durl.filter(biliStreamUrl) : [];
 }
 
+function biliDashTrackName(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    return /^https?:$/.test(url.protocol)
+      ? url.pathname.match(/\/(\d+-\d+-\d+\.m4s)$/i)?.[1] || ""
+      : "";
+  } catch {
+    return "";
+  }
+}
+
+function includeBiliCapturedTrack(urls, capturedUrl, cid) {
+  const name = biliDashTrackName(capturedUrl);
+  if (!name.startsWith(`${cid}-`)) return "";
+  if (!urls.includes(capturedUrl) && urls.some((url) => biliDashTrackName(url) === name)) {
+    urls.unshift(capturedUrl);
+  }
+  return capturedUrl;
+}
+
 function normalizeBilibiliPlayData(rawPlay = {}) {
   const candidates = [
     rawPlay,
@@ -4380,6 +4407,29 @@ async function startMediaDownloadWithFallback(urls, filename, label = "媒体") 
   );
 }
 
+async function downloadBilibiliTrack(urls, filename, label, jobId = "") {
+  if (jobId) await assertActiveJob(jobId);
+  await ensureOffscreenDocument();
+  const response = await chrome.runtime.sendMessage({
+    type: "DINGGE_READ_BILIBILI_TRACK",
+    target: "offscreen",
+    urls,
+    label,
+    jobId,
+  });
+  if (!response?.objectUrl) {
+    throw new Error(response?.error || `${label}读取失败。`);
+  }
+  if (jobId) await assertActiveJob(jobId);
+  const downloadId = await downloadWithForcedFilename({
+    url: response.objectUrl,
+    filename: await downloadPath("媒体", filename),
+    saveAs: false,
+  });
+  if (downloadId === undefined) throw new Error("浏览器没有创建下载任务。");
+  return downloadId;
+}
+
 async function resolveBilibiliDownload(
   pageUrl,
   pageIdentity = {},
@@ -4399,12 +4449,14 @@ async function resolveBilibiliDownload(
   const epId =
     Number(pageIdentity.epId || 0) ||
     Number(parsedPage.pathname.match(/\/bangumi\/play\/ep(\d+)/i)?.[1] || 0);
-  const seasonId =
-    Number(pageIdentity.seasonId || 0) ||
-    Number(parsedPage.pathname.match(/\/bangumi\/play\/ss(\d+)/i)?.[1] || 0);
+  // Regular uploads can also expose a season ID when they belong to a collection.
   const isPgc = Boolean(
-    pageIdentity.isPgc || epId || seasonId || /\/bangumi\/play\//i.test(parsedPage.pathname),
+    pageIdentity.isPgc || epId || /\/bangumi\/play\//i.test(parsedPage.pathname),
   );
+  const seasonId = isPgc
+    ? Number(pageIdentity.seasonId || 0) ||
+      Number(parsedPage.pathname.match(/\/bangumi\/play\/ss(\d+)/i)?.[1] || 0)
+    : 0;
   let pgcEpisode = null;
   let pgcSeason = null;
   if (isPgc && (epId || seasonId)) {
@@ -4562,27 +4614,47 @@ async function resolveBilibiliDownload(
     ? biliStreamUrls(progressiveVideo)
     : [];
   const audioCandidates = biliStreamUrls(audio);
+  const capturedVideoUrl = includeBiliCapturedTrack(
+    dashVideoCandidates, pageIdentity.capturedDash?.url, cid,
+  );
+  const capturedAudioUrl = includeBiliCapturedTrack(
+    audioCandidates, pageIdentity.capturedDash?.audioUrl, cid,
+  );
   const verifiedDashVideoUrl = await findFirstWorkingVideoUrl(dashVideoCandidates);
   const verifiedProgressiveVideoUrl = verifiedDashVideoUrl
     ? ""
     : await findFirstWorkingVideoUrl(progressiveVideoCandidates);
-  const usingProgressive = !verifiedDashVideoUrl && Boolean(verifiedProgressiveVideoUrl);
+  const usingCapturedDash =
+    !verifiedDashVideoUrl &&
+    !verifiedProgressiveVideoUrl &&
+    !protection.encrypted &&
+    !protection.preview &&
+    Boolean(capturedVideoUrl) &&
+    await probeVideoUrl(capturedVideoUrl);
+  const usingProgressive = Boolean(verifiedProgressiveVideoUrl) ||
+    (!usingCapturedDash && !dashVideoCandidates.length && progressiveVideoCandidates.length > 0);
   const video = usingProgressive ? progressiveVideo : dashVideo;
   const videoCandidates = usingProgressive
     ? progressiveVideoCandidates
-    : dashVideoCandidates;
+    : usingCapturedDash ? [capturedVideoUrl] : dashVideoCandidates;
+  const selectedAudioCandidates = usingProgressive ? [] : audioCandidates;
+  if (usingCapturedDash && capturedAudioUrl && !selectedAudioCandidates.includes(capturedAudioUrl)) {
+    selectedAudioCandidates.unshift(capturedAudioUrl);
+  }
   const verifiedVideoUrl =
     verifiedDashVideoUrl ||
     verifiedProgressiveVideoUrl ||
-    videoCandidates[0] ||
+    (usingCapturedDash ? capturedVideoUrl : "") ||
+    (!hlsUrls.length ? videoCandidates[0] : "") ||
     "";
   const verifiedAudioUrl =
-    (await findFirstWorkingVideoUrl(audioCandidates)) || audioCandidates[0] || "";
+    (await findFirstWorkingVideoUrl(selectedAudioCandidates)) || selectedAudioCandidates[0] || "";
   if (!hlsUrls.length && !verifiedVideoUrl) {
     throw new Error("B站视频流的主 CDN 和备用 CDN 均不可用。");
   }
-  const qualityLabel =
-    play?.accept_quality?.includes(Number(video?.id || play.quality))
+  const qualityLabel = usingCapturedDash
+    ? "当前播放画质"
+    : play?.accept_quality?.includes(Number(video?.id || play.quality))
       ? play.accept_description?.[
           play.accept_quality.indexOf(Number(video?.id || play.quality))
         ]
@@ -4591,7 +4663,7 @@ async function resolveBilibiliDownload(
         : dashVideo
           ? `${video?.id}P`
           : "HLS";
-  const selectedCodec = usingProgressive ? "MP4" : biliCodecLabel(video);
+  const selectedCodec = usingCapturedDash ? "DASH" : usingProgressive ? "MP4" : biliCodecLabel(video);
   const availableQualities = [
     ...new Set([
       ...allVideos
@@ -4663,7 +4735,7 @@ async function resolveBilibiliDownload(
     baseName,
     qualityLabel,
     requestedQuality: qn,
-    selectedQuality: Number(video?.id || play?.quality || 0),
+    selectedQuality: usingCapturedDash ? 0 : Number(video?.id || play?.quality || 0),
     selectedCodec,
     availableQualities,
     availableCodecs,
@@ -4672,8 +4744,8 @@ async function resolveBilibiliDownload(
     hlsUrls,
     videoUrl: verifiedVideoUrl,
     videoUrls: videoCandidates,
-    audioUrl: usingProgressive ? "" : verifiedAudioUrl,
-    audioUrls: usingProgressive ? [] : audioCandidates,
+    audioUrl: verifiedAudioUrl,
+    audioUrls: selectedAudioCandidates,
     videoExtension: usingProgressive ? "mp4" : "video.m4s",
     audioIncluded: usingProgressive,
     coverUrl: pgcSeason?.cover || pgcEpisode?.cover || view?.pic || "",
@@ -4697,6 +4769,7 @@ async function downloadBilibiliFromPage(
   let resolved;
   try {
     const pageIdentity = await readBilibiliPageIdentity(tabId);
+    pageIdentity.capturedDash = fallbackItem;
     if (String(requestOptions.title || "").trim()) {
       pageIdentity.currentVideoTitle = String(requestOptions.title).trim();
       pageIdentity.title = String(requestOptions.title).trim();
@@ -4762,11 +4835,12 @@ async function downloadBilibiliFromPage(
               : fallbackItem?.audioUrl,
         },
         index,
+        operationJobId,
       );
       return { ...fallback, fallback: true, warning: error?.message || "" };
-    } catch {
+    } catch (fallbackError) {
       throw new Error(
-        `${error?.message || "B站接口解析失败"}；同时没有监听到可备用的 DASH 视频流。`,
+        `${error?.message || "B站接口解析失败"}；${fallbackError?.message || "播放流回退失败。"}`,
       );
     }
   }
@@ -4782,7 +4856,7 @@ async function downloadBilibiliFromPage(
         : "";
     await updateActiveJob(operationJobId, {
       percent: 72,
-      text: `已识别 ${resolved.qualityLabel} / ${resolved.selectedCodec}${fallbackText}，正在创建下载…`,
+      text: `已识别 ${resolved.qualityLabel} / ${resolved.selectedCodec}${fallbackText}，正在读取媒体数据…`,
     });
   }
   if (
@@ -4812,10 +4886,11 @@ async function downloadBilibiliFromPage(
     }, operationJobId);
     hlsStarted = true;
   } else {
-    videoId = await startMediaDownloadWithFallback(
+    videoId = await downloadBilibiliTrack(
       [resolved.videoUrl, ...(resolved.videoUrls || [])],
       `${resolved.baseName}.${resolved.videoExtension}`,
       "B站视频",
+      operationJobId,
     );
   }
   let audioId;
@@ -4825,10 +4900,11 @@ async function downloadBilibiliFromPage(
     resolved.preferences.biliDownloadAudio &&
     resolved.audioUrl
   ) {
-    audioId = await startMediaDownloadWithFallback(
+    audioId = await downloadBilibiliTrack(
       [resolved.audioUrl, ...(resolved.audioUrls || [])],
       `${resolved.baseName}.audio.m4s`,
       "B站音频",
+      operationJobId,
     );
   }
   if (resolved.preferences.biliDownloadCover && resolved.coverUrl) {
@@ -4952,6 +5028,8 @@ async function downloadBilibiliContextVideo(tab, jobId, requestOptions = {}) {
         ? "已创建包含声音的 MP4 视频下载。"
         : result.audioDownloaded
         ? "已分别创建视频流和音频流下载。"
+        : requestOptions.settings?.biliDownloadAudio === false
+        ? "已创建仅视频轨下载。"
         : "已创建视频流下载；当前页面没有取得音频流。"
     }`,
   );
@@ -5043,7 +5121,7 @@ async function packageBilibiliParts(tab, jobId, requestOptions = {}) {
   };
 }
 
-async function downloadBilibiliDashItem(item, index = 0) {
+async function downloadBilibiliDashItem(item, index = 0, jobId = "") {
   const videoUrl = String(item?.url || "");
   const audioUrl = String(item?.audioUrl || "");
   if (!/^https?:/i.test(videoUrl)) {
@@ -5052,18 +5130,24 @@ async function downloadBilibiliDashItem(item, index = 0) {
   const baseName =
     sanitizeFilename(item?.name) ||
     mediaFilename({ url: videoUrl, kind: "video", alt: "bilibili-video" }, index);
-  const videoId = await downloadWithForcedFilename({
-    url: videoUrl,
-    filename: await downloadPath("媒体", replaceMediaExtension(baseName, "video")),
-    saveAs: false,
-  });
+  if (jobId && /^https?:/i.test(audioUrl)) {
+    await assertActiveJob(jobId);
+    await startDashMuxTask({
+      jobId,
+      videoUrls: [videoUrl],
+      audioUrls: [audioUrl],
+      filename: replaceMediaExtension(baseName, "video").replace(/\.video\.m4s$/i, ".mp4"),
+    }, jobId);
+    return { muxStarted: true, videoDownloaded: false, audioDownloaded: false };
+  }
+  const videoId = await downloadBilibiliTrack(
+    [videoUrl], replaceMediaExtension(baseName, "video"), "B站视频", jobId,
+  );
   let audioId;
   if (/^https?:/i.test(audioUrl)) {
-    audioId = await downloadWithForcedFilename({
-      url: audioUrl,
-      filename: await downloadPath("媒体", replaceMediaExtension(baseName, "audio")),
-      saveAs: false,
-    });
+    audioId = await downloadBilibiliTrack(
+      [audioUrl], replaceMediaExtension(baseName, "audio"), "B站音频", jobId,
+    );
   }
   return {
     videoDownloaded: videoId !== undefined,

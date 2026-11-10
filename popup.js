@@ -2736,6 +2736,7 @@ async function downloadSelectedImages() {
       const dashResponse = await chrome.runtime.sendMessage({
         type: "DINGGE_BILIBILI_DASH_DOWNLOAD",
         target: "background",
+        tabId: state.tab?.id,
         items: dashItems,
         pageUrl: state.tab?.url || "",
       });

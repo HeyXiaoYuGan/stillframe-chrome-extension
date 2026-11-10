@@ -1,5 +1,27 @@
 # StillFrame 版本说明 / Release Notes
 
+## v1.0.5
+
+### 中文公告
+
+定格 StillFrame 1.0.5 修复了部分 B 站视频下载后变成几百字节 `.htm` 文件的问题。
+
+- 修正普通视频合集误用番剧接口的问题，并恢复 B 站 CDN 请求所需的来源头。
+- B 站专用下载在需要时会使用媒体模式捕获的同一分 P 的播放流。
+- 保存前校验收到的媒体数据。遇到错误页或不完整的响应时，会尝试备用地址。
+
+更新扩展后，请刷新已打开的 B 站页面再下载。
+
+### English announcement
+
+StillFrame 1.0.5 fixes an issue that caused some Bilibili video downloads to be saved as tiny `.htm` files.
+
+- Regular video collections now use the correct playback API, and Bilibili CDN requests carry the required referrer header.
+- When needed, the dedicated Bilibili downloader can use the stream captured by Media mode for the same video part.
+- StillFrame validates the media before saving and tries a backup URL if the CDN returns an error page or an incomplete response.
+
+After updating, refresh any open Bilibili pages before downloading again.
+
 ## v1.0.4
 
 ### 中文
